@@ -97,14 +97,6 @@ chmod +x gitnav.py
 python gitnav.py
 ```
 
-### Alternative Installation Methods
-
-**Using pip (if published to PyPI):**
-```bash
-pip install gitnav
-gitnav
-```
-
 **Direct download:**
 ```bash
 wget https://raw.githubusercontent.com/0xb0rn3/gitnav/main/gitnav.py
