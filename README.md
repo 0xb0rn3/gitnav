@@ -25,7 +25,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.7+-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![GitHub Issues](https://img.shields.io/badge/Issues-Welcome-red.svg)](https://github.com/your-username/gitnav/issues)
+[![GitHub Issues](https://img.shields.io/badge/Issues-Welcome-red.svg)](https://github.com/0xb0rn3/gitnav/issues)
 [![Contributions](https://img.shields.io/badge/Contributions-Welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 </div>
@@ -82,7 +82,7 @@ Ensure you have the following installed on your system:
 
 ```bash
 # Clone the GitNav repository
-git clone https://github.com/your-username/gitnav.git
+git clone https://github.com/0xb0rn3/gitnav.git
 
 # Navigate to the project directory
 cd gitnav
@@ -107,7 +107,7 @@ gitnav
 
 **Direct download:**
 ```bash
-wget https://raw.githubusercontent.com/your-username/gitnav/main/gitnav.py
+wget https://raw.githubusercontent.com/0xb0rn3/gitnav/main/gitnav.py
 python gitnav.py
 ```
 
@@ -147,8 +147,3 @@ GitNav presents a comprehensive menu system with the following options:
 
 ### Example Workflow
 
-Here's a typical GitNav session demonstrating its power:
-
-```
-🚀 GitNav v0.0.2
-Enter GitHub username: octocat
