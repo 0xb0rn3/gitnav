@@ -2,7 +2,7 @@
 """
 GitNav v0.0.4 - Enhanced GitHub Navigator with Full Backup & Proxy Support
 A comprehensive tool for exploring, managing, and backing up GitHub repositories
-Features: Full repo backup, custom backup directories, sync updates, proxy rotation
+Features: Custom backup paths, depth control, full repo backup, sync updates, proxy rotation
 """
 
 import requests
@@ -26,6 +26,7 @@ API_BASE = "https://api.github.com"
 VERSION = "0.0.4"
 DEFAULT_BACKUP_DIR = "github_backups"
 CLONE_THREADS = 3  # Number of parallel clone operations
+DEFAULT_CLONE_DEPTH = None  # None for full clone, or specify depth
 
 class ProxyManager:
     """Manages proxy rotation for handling rate limits and large operations"""
@@ -99,9 +100,19 @@ class BackupManager:
         self.backup_dir = Path(backup_dir)
         self.backup_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_file = self.backup_dir / "backup_metadata.json"
-        self.config_file = self.backup_dir / "backup_config.json"
+        self.clone_depth = DEFAULT_CLONE_DEPTH
         self.load_metadata()
-        self.load_config()
+    
+    def set_backup_dir(self, new_dir):
+        """Change the backup directory"""
+        self.backup_dir = Path(new_dir)
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        self.metadata_file = self.backup_dir / "backup_metadata.json"
+        self.load_metadata()
+    
+    def set_clone_depth(self, depth):
+        """Set the clone depth for git operations"""
+        self.clone_depth = depth if depth and depth > 0 else None
     
     def load_metadata(self):
         """Load backup metadata from file"""
@@ -118,46 +129,6 @@ class BackupManager:
         """Save backup metadata to file"""
         with open(self.metadata_file, 'w') as f:
             json.dump(self.metadata, f, indent=2)
-    
-    def load_config(self):
-        """Load backup configuration"""
-        if self.config_file.exists():
-            try:
-                with open(self.config_file, 'r') as f:
-                    self.config = json.load(f)
-            except:
-                self.config = {"backup_dir": str(self.backup_dir)}
-        else:
-            self.config = {"backup_dir": str(self.backup_dir)}
-    
-    def save_config(self):
-        """Save backup configuration"""
-        with open(self.config_file, 'w') as f:
-            json.dump(self.config, f, indent=2)
-    
-    def change_backup_directory(self, new_dir):
-        """Change the backup directory"""
-        new_path = Path(new_dir)
-        new_path.mkdir(parents=True, exist_ok=True)
-        
-        # Move metadata file if it exists
-        if self.metadata_file.exists():
-            old_metadata = self.metadata_file
-            self.backup_dir = new_path
-            self.metadata_file = self.backup_dir / "backup_metadata.json"
-            
-            # Copy metadata to new location
-            import shutil
-            shutil.copy2(old_metadata, self.metadata_file)
-        else:
-            self.backup_dir = new_path
-            self.metadata_file = self.backup_dir / "backup_metadata.json"
-        
-        self.config_file = self.backup_dir / "backup_config.json"
-        self.config["backup_dir"] = str(self.backup_dir)
-        self.save_config()
-        
-        return True
     
     def get_user_backup_dir(self, username):
         """Get or create user-specific backup directory"""
@@ -277,14 +248,25 @@ def format_date(date_string):
     except:
         return date_string
 
-def clone_repo_with_progress(clone_url, repo_path, repo_name):
-    """Clone repository with progress indication"""
+def clone_repo_with_progress(clone_url, repo_path, repo_name, depth=None):
+    """Clone repository with progress indication and depth control"""
     try:
         print(f"📥 Cloning {repo_name}...")
         
+        # Build git command with optional depth
+        git_cmd = ["git", "clone", "--progress"]
+        
+        if depth and depth > 0:
+            git_cmd.extend(["--depth", str(depth)])
+            print(f"   Using shallow clone with depth={depth}")
+        else:
+            print(f"   Performing full clone")
+        
+        git_cmd.extend([clone_url, str(repo_path)])
+        
         # Use subprocess to show git progress
         process = subprocess.Popen(
-            ["git", "clone", "--progress", clone_url, str(repo_path)],
+            git_cmd,
             stderr=subprocess.PIPE,
             universal_newlines=True
         )
@@ -305,12 +287,21 @@ def clone_repo_with_progress(clone_url, repo_path, repo_name):
         print(f"❌ Error cloning {repo_name}: {e}")
         return False
 
-def update_repo(repo_path, repo_name):
-    """Update an existing repository"""
+def update_repo(repo_path, repo_name, depth=None):
+    """Update an existing repository with depth control"""
     try:
         print(f"🔄 Updating {repo_name}...")
         
-        # Change to repo directory and pull
+        # First, check if we need to convert shallow to full clone
+        if depth is None:
+            # If depth is None, ensure we have full history
+            subprocess.run(
+                ["git", "-C", str(repo_path), "fetch", "--unshallow"],
+                capture_output=True,
+                text=True
+            )
+        
+        # Pull updates
         result = subprocess.run(
             ["git", "-C", str(repo_path), "pull", "--all"],
             capture_output=True,
@@ -331,6 +322,66 @@ def update_repo(repo_path, repo_name):
         print(f"❌ Error updating {repo_name}: {e}")
         return False
 
+def configure_backup_settings(backup_manager):
+    """Configure backup directory and clone depth settings"""
+    print("\n⚙️ Backup Configuration")
+    print("=" * 40)
+    print(f"Current backup directory: {backup_manager.backup_dir.absolute()}")
+    print(f"Current clone depth: {backup_manager.clone_depth if backup_manager.clone_depth else 'Full (no depth limit)'}")
+    
+    print("\n1. Change backup directory")
+    print("2. Set clone depth")
+    print("3. View current settings")
+    print("4. Back to main menu")
+    
+    choice = input("\nEnter choice (1-4): ").strip()
+    
+    if choice == '1':
+        new_dir = input(f"Enter new backup directory path (current: {backup_manager.backup_dir}): ").strip()
+        if new_dir:
+            try:
+                backup_manager.set_backup_dir(new_dir)
+                print(f"✅ Backup directory changed to: {backup_manager.backup_dir.absolute()}")
+            except Exception as e:
+                print(f"❌ Error setting backup directory: {e}")
+    
+    elif choice == '2':
+        print("\n🔍 Clone Depth Settings:")
+        print("   • Enter 0 or leave empty for full clone (all history)")
+        print("   • Enter a number (e.g., 1, 10, 100) for shallow clone")
+        print("   • Shallow clones are faster and use less space")
+        print("   • Full clones preserve complete history")
+        
+        depth_input = input("\nEnter clone depth (0 for full): ").strip()
+        
+        if not depth_input or depth_input == '0':
+            backup_manager.set_clone_depth(None)
+            print("✅ Set to full clone (no depth limit)")
+        else:
+            try:
+                depth = int(depth_input)
+                if depth > 0:
+                    backup_manager.set_clone_depth(depth)
+                    print(f"✅ Clone depth set to: {depth}")
+                else:
+                    print("❌ Depth must be a positive number")
+            except ValueError:
+                print("❌ Invalid input. Please enter a number.")
+    
+    elif choice == '3':
+        print(f"\n📊 Current Settings:")
+        print(f"   • Backup directory: {backup_manager.backup_dir.absolute()}")
+        print(f"   • Clone depth: {backup_manager.clone_depth if backup_manager.clone_depth else 'Full (no depth limit)'}")
+        print(f"   • Directory exists: {'Yes' if backup_manager.backup_dir.exists() else 'No'}")
+        
+        # Show disk space
+        try:
+            import shutil
+            total, used, free = shutil.disk_usage(backup_manager.backup_dir)
+            print(f"   • Free space: {format_size(free)} / {format_size(total)}")
+        except:
+            pass
+
 def backup_all_repos(api, repos, username, backup_manager, max_workers=CLONE_THREADS):
     """Backup all repositories for a user with parallel cloning"""
     if not repos:
@@ -339,6 +390,7 @@ def backup_all_repos(api, repos, username, backup_manager, max_workers=CLONE_THR
     
     user_dir = backup_manager.get_user_backup_dir(username)
     print(f"\n🗂️ Backup directory: {user_dir.absolute()}")
+    print(f"📏 Clone depth: {backup_manager.clone_depth if backup_manager.clone_depth else 'Full (no limit)'}")
     
     # Separate repos into already cloned and new
     to_clone = []
@@ -367,7 +419,13 @@ def backup_all_repos(api, repos, username, backup_manager, max_workers=CLONE_THR
     # Confirm backup
     print(f"\n⚠️ This will clone {len(to_clone)} repositories")
     total_size = sum(repo['size'] * 1024 for repo in to_clone)
-    print(f"   Estimated size: {format_size(total_size)}")
+    
+    # Adjust size estimate if using shallow clone
+    if backup_manager.clone_depth:
+        estimated_size = total_size * 0.3  # Rough estimate: shallow clones are ~30% of full size
+        print(f"   Estimated size (shallow): ~{format_size(estimated_size)}")
+    else:
+        print(f"   Estimated size (full): ~{format_size(total_size)}")
     
     confirm = input("\nProceed with backup? (y/n): ").lower()
     if confirm != 'y':
@@ -390,7 +448,8 @@ def backup_all_repos(api, repos, username, backup_manager, max_workers=CLONE_THR
                 clone_repo_with_progress,
                 repo['clone_url'],
                 repo_path,
-                repo['name']
+                repo['name'],
+                backup_manager.clone_depth
             )
             futures[future] = repo
         
@@ -406,7 +465,8 @@ def backup_all_repos(api, repos, username, backup_manager, max_workers=CLONE_THR
                         'size': repo['size'],
                         'language': repo.get('language', 'Unknown'),
                         'description': repo.get('description', ''),
-                        'clone_url': repo['clone_url']
+                        'clone_url': repo['clone_url'],
+                        'clone_depth': backup_manager.clone_depth
                     })
                     print(f"   ✅ [{successful}/{len(to_clone)}] {repo['name']} backed up")
                 else:
@@ -446,7 +506,7 @@ def update_all_cloned_repos(backup_manager, repos, username, max_workers=CLONE_T
         for repo in repos:
             repo_path = user_dir / repo['name']
             if repo_path.exists():
-                future = executor.submit(update_repo, repo_path, repo['name'])
+                future = executor.submit(update_repo, repo_path, repo['name'], backup_manager.clone_depth)
                 futures[future] = repo
         
         for future in as_completed(futures):
@@ -506,7 +566,7 @@ def sync_backup(api, repos, username, backup_manager):
     
     if deleted_repos:
         print(f"\n⚠️ These repositories exist locally but not on GitHub:")
-        for repo_name in deleted_repos:
+        for repo_name in sorted(deleted_repos):
             print(f"   • {repo_name}")
     
     if not to_clone and not to_update:
@@ -530,78 +590,6 @@ def sync_backup(api, repos, username, backup_manager):
         update_all_cloned_repos(backup_manager, to_update, username)
     
     print(f"\n✅ Synchronization complete!")
-
-def manage_backup_settings(backup_manager):
-    """Manage backup directory settings"""
-    while True:
-        print(f"\n📁 Backup Directory Settings")
-        print("=" * 40)
-        print(f"Current directory: {backup_manager.backup_dir.absolute()}")
-        
-        print("\n1. Change backup directory")
-        print("2. Create new backup profile")
-        print("3. List backup profiles")
-        print("4. View directory size")
-        print("5. Back to main menu")
-        
-        choice = input("\nEnter choice (1-5): ").strip()
-        
-        if choice == '1':
-            new_dir = input("Enter new backup directory path: ").strip()
-            if new_dir:
-                try:
-                    if backup_manager.change_backup_directory(new_dir):
-                        print(f"✅ Backup directory changed to: {backup_manager.backup_dir.absolute()}")
-                except Exception as e:
-                    print(f"❌ Error changing directory: {e}")
-            else:
-                print("❌ Invalid directory path")
-                
-        elif choice == '2':
-            profile_name = input("Enter profile name: ").strip()
-            if profile_name:
-                profile_dir = Path(DEFAULT_BACKUP_DIR) / "profiles" / profile_name
-                try:
-                    profile_dir.mkdir(parents=True, exist_ok=True)
-                    print(f"✅ Created profile directory: {profile_dir.absolute()}")
-                    use_now = input("Use this profile now? (y/n): ").lower()
-                    if use_now == 'y':
-                        backup_manager.change_backup_directory(str(profile_dir))
-                        print(f"✅ Now using profile: {profile_name}")
-                except Exception as e:
-                    print(f"❌ Error creating profile: {e}")
-                    
-        elif choice == '3':
-            profiles_dir = Path(DEFAULT_BACKUP_DIR) / "profiles"
-            if profiles_dir.exists():
-                profiles = [d.name for d in profiles_dir.iterdir() if d.is_dir()]
-                if profiles:
-                    print("\n📋 Available backup profiles:")
-                    for profile in profiles:
-                        print(f"   • {profile}")
-                else:
-                    print("No profiles found")
-            else:
-                print("No profiles directory found")
-                
-        elif choice == '4':
-            if backup_manager.backup_dir.exists():
-                total_size = 0
-                file_count = 0
-                for item in backup_manager.backup_dir.rglob('*'):
-                    if item.is_file():
-                        total_size += item.stat().st_size
-                        file_count += 1
-                print(f"\n📊 Directory Statistics:")
-                print(f"   • Total size: {format_size(total_size)}")
-                print(f"   • Total files: {file_count:,}")
-            else:
-                print("Backup directory doesn't exist yet")
-                
-        elif choice == '5':
-            break
-        else:
-            print("❌ Invalid choice")
 
 def manage_proxies(proxy_manager):
     """Manage proxy settings and configuration"""
@@ -692,6 +680,7 @@ def view_backup_status(backup_manager, username):
     print(f"\n📊 Backup Status for {username}")
     print("=" * 50)
     print(f"📁 Backup directory: {user_dir.absolute()}")
+    print(f"📏 Default clone depth: {backup_manager.clone_depth if backup_manager.clone_depth else 'Full (no limit)'}")
     
     if not user_dir.exists():
         print("No backups found for this user.")
@@ -700,10 +689,20 @@ def view_backup_status(backup_manager, username):
     # Count backed up repositories
     backed_up = []
     total_size = 0
+    shallow_count = 0
+    full_count = 0
     
     for repo_dir in user_dir.iterdir():
         if repo_dir.is_dir() and (repo_dir / '.git').exists():
             backed_up.append(repo_dir.name)
+            
+            # Check if shallow clone
+            info = backup_manager.get_repo_info(username, repo_dir.name)
+            if info.get('clone_depth'):
+                shallow_count += 1
+            else:
+                full_count += 1
+            
             # Get directory size
             try:
                 size = sum(f.stat().st_size for f in repo_dir.rglob('*') if f.is_file())
@@ -713,7 +712,17 @@ def view_backup_status(backup_manager, username):
     
     print(f"\n📈 Statistics:")
     print(f"   • Total repositories backed up: {len(backed_up)}")
+    print(f"   • Full clones: {full_count}")
+    print(f"   • Shallow clones: {shallow_count}")
     print(f"   • Total backup size: {format_size(total_size)}")
+    
+    # Show disk space
+    try:
+        import shutil
+        total, used, free = shutil.disk_usage(backup_manager.backup_dir)
+        print(f"   • Available disk space: {format_size(free)} / {format_size(total)}")
+    except:
+        pass
     
     # Show recent backups
     recent_backups = []
@@ -729,9 +738,11 @@ def view_backup_status(backup_manager, username):
         print(f"\n🕐 Recently updated (top 10):")
         for repo_name, info in recent_backups[:10]:
             updated = info.get('last_updated', 'Unknown')
+            depth = info.get('clone_depth', None)
+            depth_str = f" (depth: {depth})" if depth else " (full)"
             if updated != 'Unknown':
                 updated = format_date(updated)
-            print(f"   • {repo_name}: {updated}")
+            print(f"   • {repo_name}: {updated}{depth_str}")
     
     # Show backup metadata
     metadata_size = backup_manager.metadata_file.stat().st_size if backup_manager.metadata_file.exists() else 0
@@ -864,8 +875,8 @@ def search_repos(repos):
     else:
         print("❌ No matching repositories found.")
 
-def clone_repository(repos):
-    """Handle single repository cloning with user selection"""
+def clone_repository(repos, backup_manager):
+    """Handle single repository cloning with user selection and depth control"""
     if not repos:
         print("No repositories available to clone.")
         return
@@ -878,17 +889,30 @@ def clone_repository(repos):
             clone_url = repo['clone_url']
             repo_name = repo['name']
             
-            # Ask for destination directory
-            dest_dir = input(f"Enter destination directory (default: current directory): ").strip()
-            if dest_dir:
-                dest_path = Path(dest_dir) / repo_name
-            else:
-                dest_path = Path(repo_name)
+            # Ask for clone depth
+            print(f"\n📏 Clone depth (press Enter for default: {backup_manager.clone_depth if backup_manager.clone_depth else 'Full'}):")
+            depth_input = input("   Enter depth (0 for full, or number for shallow): ").strip()
             
-            # Clone to specified directory
-            if clone_repo_with_progress(clone_url, dest_path, repo_name):
+            depth = None
+            if depth_input:
+                if depth_input == '0':
+                    depth = None
+                else:
+                    try:
+                        depth = int(depth_input)
+                        if depth < 0:
+                            print("❌ Depth must be positive")
+                            return
+                    except ValueError:
+                        print("❌ Invalid depth value")
+                        return
+            else:
+                depth = backup_manager.clone_depth
+            
+            # Clone to current directory
+            if clone_repo_with_progress(clone_url, repo_name, repo_name, depth):
                 print(f"✅ Repository '{repo_name}' cloned successfully!")
-                print(f"📁 Files saved to: {dest_path.absolute()}")
+                print(f"📁 Files saved to: {os.path.abspath(repo_name)}")
             else:
                 print(f"❌ Failed to clone repository")
         else:
@@ -962,7 +986,7 @@ def display_menu():
     print("  8.  💾 Backup ALL repositories")
     print("  9.  🔄 Sync/Update backup")
     print("  10. 📊 View backup status")
-    print("  11. 📁 Backup directory settings")
+    print("  11. ⚙️ Configure backup settings")
     
     print("\nSettings:")
     print("  12. 🌐 Manage proxies")
@@ -989,7 +1013,7 @@ def menu_loop(api, repos, username, backup_manager, proxy_manager):
         elif choice == '4':
             display_repo_stats(repos)
         elif choice == '5':
-            clone_repository(repos)
+            clone_repository(repos, backup_manager)
         elif choice == '6':
             view_readme(api, repos, username)
         elif choice == '7':
@@ -1001,7 +1025,7 @@ def menu_loop(api, repos, username, backup_manager, proxy_manager):
         elif choice == '10':
             view_backup_status(backup_manager, username)
         elif choice == '11':
-            manage_backup_settings(backup_manager)
+            configure_backup_settings(backup_manager)
         elif choice == '12':
             manage_proxies(proxy_manager)
         elif choice == '13':
@@ -1028,12 +1052,12 @@ def display_banner():
     banner = """
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║                                                                              ║
-║   ██████╗ ██╗████████╗███╗   ██╗ █████╗ ██╗   ██╗    ██╗   ██╗██████╗      ║
-║  ██╔════╝ ██║╚══██╔══╝████╗  ██║██╔══██╗██║   ██║    ██║   ██║╚════██╗     ║
-║  ██║  ███╗██║   ██║   ██╔██╗ ██║███████║██║   ██║    ██║   ██║ █████╔╝     ║
-║  ██║   ██║██║   ██║   ██║╚██╗██║██╔══██║╚██╗ ██╔╝    ╚██╗ ██╔╝██╔═══╝      ║
-║  ╚██████╔╝██║   ██║   ██║ ╚████║██║  ██║ ╚████╔╝      ╚████╔╝ ███████╗     ║
-║   ╚═════╝ ╚═╝   ╚═╝   ╚═╝  ╚═══╝╚═╝  ╚═╝  ╚═══╝        ╚═══╝  ╚══════╝     ║
+║   ██████╗ ██╗████████╗███╗   ██╗ █████╗ ██╗   ██╗    ██╗   ██╗██╗  ██╗     ║
+║  ██╔════╝ ██║╚══██╔══╝████╗  ██║██╔══██╗██║   ██║    ██║   ██║██║  ██║     ║
+║  ██║  ███╗██║   ██║   ██╔██╗ ██║███████║██║   ██║    ██║   ██║███████║     ║
+║  ██║   ██║██║   ██║   ██║╚██╗██║██╔══██║╚██╗ ██╔╝    ╚██╗ ██╔╝╚════██║     ║
+║  ╚██████╔╝██║   ██║   ██║ ╚████║██║  ██║ ╚████╔╝      ╚████╔╝      ██║     ║
+║   ╚═════╝ ╚═╝   ╚═╝   ╚═╝  ╚═══╝╚═╝  ╚═╝  ╚═══╝        ╚═══╝       ╚═╝     ║
 ║                                                                              ║
 ║               🚀 Enhanced GitHub Repository Navigator & Backup Tool          ║
 ║                              Version """ + VERSION + """                                   ║
@@ -1041,7 +1065,7 @@ def display_banner():
 ║                        💻 Coded by 0xb0rn3 | 0xbv1 💻                        ║
 ║                    🌟 Your Gateway to GitHub Excellence 🌟                   ║
 ║                                                                              ║
-║  Features: Custom Backup Dirs | Full Backup | Sync | Proxy Support          ║
+║  Features: Custom Paths | Depth Control | Proxy Support | Parallel Cloning  ║
 ║                                                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
     """
@@ -1050,76 +1074,85 @@ def display_banner():
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description="GitNav - Enhanced GitHub Repository Navigator & Backup Tool",
+        description='GitNav - Enhanced GitHub Repository Navigator & Backup Tool',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
     parser.add_argument(
-        "-u", "--username",
-        help="GitHub username to explore"
+        'username',
+        nargs='?',
+        help='GitHub username to explore'
     )
     
     parser.add_argument(
-        "-d", "--backup-dir",
+        '-d', '--depth',
+        type=int,
+        default=None,
+        help='Clone depth for git operations (default: full clone)'
+    )
+    
+    parser.add_argument(
+        '-b', '--backup-dir',
         default=DEFAULT_BACKUP_DIR,
-        help=f"Backup directory path (default: {DEFAULT_BACKUP_DIR})"
+        help=f'Backup directory path (default: {DEFAULT_BACKUP_DIR})'
     )
     
     parser.add_argument(
-        "-p", "--use-proxy",
-        action="store_true",
-        help="Enable proxy rotation if proxies are configured"
-    )
-    
-    parser.add_argument(
-        "-t", "--threads",
+        '-t', '--threads',
         type=int,
         default=CLONE_THREADS,
-        help=f"Number of parallel clone threads (default: {CLONE_THREADS})"
+        help=f'Number of parallel clone threads (default: {CLONE_THREADS})'
     )
     
     parser.add_argument(
-        "--backup-all",
-        action="store_true",
-        help="Immediately backup all repositories for the specified user"
+        '--proxy-file',
+        help='Path to proxy list file'
     )
     
     parser.add_argument(
-        "--sync",
-        action="store_true",
-        help="Sync/update existing backup for the specified user"
+        '--enable-proxy',
+        action='store_true',
+        help='Enable proxy rotation on start'
     )
     
     return parser.parse_args()
 
 def main():
     """Main function with enhanced features"""
-    # Parse command line arguments
     args = parse_arguments()
-    
-    # Update global settings if provided
-    if args.threads:
-        global CLONE_THREADS
-        CLONE_THREADS = args.threads
     
     display_banner()
     
-    # Initialize managers with custom backup directory
+    # Initialize managers with command line arguments
     proxy_manager = ProxyManager()
     backup_manager = BackupManager(args.backup_dir)
     
-    # Show current backup directory
-    print(f"📁 Using backup directory: {backup_manager.backup_dir.absolute()}")
+    # Set clone depth if specified
+    if args.depth:
+        backup_manager.set_clone_depth(args.depth)
+        print(f"📏 Clone depth set to: {args.depth}")
     
-    # Check for proxy configuration
-    if args.use_proxy and proxy_manager.proxies:
+    # Load proxies from file if specified
+    if args.proxy_file and os.path.exists(args.proxy_file):
+        try:
+            with open(args.proxy_file, 'r') as f:
+                proxies = [line.strip() for line in f if line.strip()]
+            proxy_manager.proxies.extend(proxies)
+            print(f"📡 Loaded {len(proxies)} proxies from {args.proxy_file}")
+        except Exception as e:
+            print(f"⚠️ Could not load proxy file: {e}")
+    
+    # Enable proxy if specified
+    if args.enable_proxy and proxy_manager.proxies:
         proxy_manager.enabled = True
-        print(f"🌐 Proxy rotation enabled with {len(proxy_manager.proxies)} proxies")
-    elif proxy_manager.proxies and not args.use_proxy:
+        print("🌐 Proxy rotation enabled")
+    
+    # Check for proxy configuration if not already enabled
+    if proxy_manager.proxies and not proxy_manager.enabled:
         use_proxies = input(f"\n🌐 Found {len(proxy_manager.proxies)} proxies. Enable proxy rotation? (y/n): ").lower()
         proxy_manager.enabled = (use_proxies == 'y')
     
-    # Get username
+    # Get username from args or prompt
     username = args.username
     if not username:
         username = input("\nEnter GitHub username: ").strip()
@@ -1136,16 +1169,11 @@ def main():
         print(f"✅ Found {len(repos)} repositories!")
         display_repo_stats(repos)
         
-        # Handle direct action arguments
-        if args.backup_all:
-            print("\n📦 Starting automatic backup...")
-            backup_all_repos(api, repos, username, backup_manager, CLONE_THREADS)
-        elif args.sync:
-            print("\n🔄 Starting automatic sync...")
-            sync_backup(api, repos, username, backup_manager)
-        else:
-            # Enter interactive menu
-            menu_loop(api, repos, username, backup_manager, proxy_manager)
+        # Set threads for parallel operations
+        global CLONE_THREADS
+        CLONE_THREADS = args.threads
+        
+        menu_loop(api, repos, username, backup_manager, proxy_manager)
     else:
         print("❌ Unable to proceed without repositories.")
         print("   Please check the username and try again.")
