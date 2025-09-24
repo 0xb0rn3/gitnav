@@ -159,11 +159,52 @@ class GitHubAPI:
     def make_request(self, url, params=None):
         """Make API request with proxy rotation and rate limit handling"""
         try:
-            # Apply rate limiting to avoid hitting GitHub limits
+            # Apply rate limiting
             self._apply_rate_limit()
             
             # Get proxy if enabled
             proxies = None
+            if self.proxy_manager and self.proxy_manager.enabled:
+                proxies = self.proxy_manager.get_next_proxy()
+                if proxies:
+                    print(f"🔄 Using proxy for request #{self.request_count + 1}")
+            
+            response = requests.get(
+                url, 
+                headers=self.headers, 
+                params=params, 
+                proxies=proxies,
+                timeout=15
+            )
+            
+            self.request_count += 1
+            
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 404:
+                print("❌ Error: Resource not found")
+            elif response.status_code == 403:
+                print("❌ Error: API rate limit exceeded")
+                if 'X-RateLimit-Reset' in response.headers:
+                    reset_time = datetime.fromtimestamp(int(response.headers['X-RateLimit-Reset']))
+                    print(f"   Rate limit resets at: {reset_time}")
+                    
+                    # If using proxies, try rotating to next one
+                    if self.proxy_manager and self.proxy_manager.enabled:
+                        print("   Rotating to next proxy...")
+                        return self.make_request(url, params)  # Retry with next proxy
+            else:
+                print(f"❌ Error: HTTP {response.status_code}")
+            
+            return None
+            
+        except requests.exceptions.Timeout:
+            print("❌ Error: Request timed out")
+            if self.proxy_manager and self.proxy_manager.enabled:
+                print("   Trying next proxy...")
+                return self.make_request(url, params)
+        except requests.exceptions.ProxyError:
+            print("❌ Error: Proxy connection failed")
             if self.proxy_manager and self.proxy_manager.enabled:
                 print("   Trying next proxy...")
                 return self.make_request(url, params)
@@ -919,45 +960,4 @@ if __name__ == "__main__":
         sys.exit(0)
     except Exception as e:
         print(f"\n❌ Unexpected error: {e}")
-        sys.exit(1).enabled:
-                proxies = self.proxy_manager.get_next_proxy()
-                if proxies:
-                    print(f"🔄 Using proxy for request #{self.request_count + 1}")
-            
-            response = requests.get(
-                url, 
-                headers=self.headers, 
-                params=params, 
-                proxies=proxies,
-                timeout=15
-            )
-            
-            self.request_count += 1
-            
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 404:
-                print("❌ Error: Resource not found")
-            elif response.status_code == 403:
-                print("❌ Error: API rate limit exceeded")
-                if 'X-RateLimit-Reset' in response.headers:
-                    reset_time = datetime.fromtimestamp(int(response.headers['X-RateLimit-Reset']))
-                    print(f"   Rate limit resets at: {reset_time}")
-                    
-                    # If using proxies, try rotating to next one
-                    if self.proxy_manager and self.proxy_manager.enabled:
-                        print("   Rotating to next proxy...")
-                        return self.make_request(url, params)  # Retry with next proxy
-            else:
-                print(f"❌ Error: HTTP {response.status_code}")
-            
-            return None
-            
-        except requests.exceptions.Timeout:
-            print("❌ Error: Request timed out")
-            if self.proxy_manager and self.proxy_manager.enabled:
-                print("   Trying next proxy...")
-                return self.make_request(url, params)
-        except requests.exceptions.ProxyError:
-            print("❌ Error: Proxy connection failed")
-            if self.proxy_manager and self.proxy_manager
+        sys.exit(1)
