@@ -1,0 +1,1267 @@
+#!/usr/bin/env python3
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GitNav v0.1.0  —  Enhanced GitHub Repository Navigator
+#  Dev    : oxbv1 | oxborn3
+#  Contact: contact@oxborn3.com
+#  Site   : oxborn3.com
+#  Repo   : github.com/0xb0rn3/gitnav
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import sys, os, time, shutil, subprocess, threading, webbrowser
+import argparse, textwrap, re, struct, fcntl, termios, signal
+from pathlib import Path
+from datetime import datetime
+from collections import defaultdict
+
+# Colour shortcuts needed before the C class (used in bootstrap)
+_C = "\033[96m"; _R = "\033[0m"; _G = "\033[92m"; _Y = "\033[93m"
+
+def _bootstrap_requests():
+    """
+    Attempt to import requests. If missing, detect the distro/package manager
+    and try to install it automatically, falling back through multiple strategies.
+    Handles PEP 668 (externally-managed-environment) on Arch, Debian 12+, etc.
+    """
+    try:
+        import requests as _r
+        return _r
+    except ImportError:
+        pass
+
+    # ── Detect available package managers ─────────────────────────────────────
+    def _which(cmd):
+        return shutil.which(cmd) is not None
+
+    def _try(cmd, desc):
+        print(f"  → {desc}")
+        r = subprocess.run(cmd, capture_output=True)
+        return r.returncode == 0
+
+    print(f"\n  {_C}[!]{_R} 'requests' is not installed.\n")
+
+    # Arch / pacman
+    if _which("pacman"):
+        print(f"  {_Y}Detected Arch Linux (pacman){_R}")
+        if _try(["sudo","pacman","-S","--noconfirm","python-requests"],
+                "sudo pacman -S python-requests"):
+            try:
+                import requests as _r; print(f"  {_G}✓ Installed via pacman{_R}\n"); return _r
+            except ImportError: pass
+
+    # Debian / Ubuntu / apt
+    if _which("apt-get"):
+        print(f"  {_Y}Detected Debian/Ubuntu (apt){_R}")
+        if _try(["sudo","apt-get","install","-y","python3-requests"],
+                "sudo apt-get install python3-requests"):
+            try:
+                import requests as _r; print(f"  {_G}✓ Installed via apt{_R}\n"); return _r
+            except ImportError: pass
+
+    # Fedora / dnf
+    if _which("dnf"):
+        print(f"  {_Y}Detected Fedora/RHEL (dnf){_R}")
+        if _try(["sudo","dnf","install","-y","python3-requests"],
+                "sudo dnf install python3-requests"):
+            try:
+                import requests as _r; print(f"  {_G}✓ Installed via dnf{_R}\n"); return _r
+            except ImportError: pass
+
+    # openSUSE / zypper
+    if _which("zypper"):
+        print(f"  {_Y}Detected openSUSE (zypper){_R}")
+        if _try(["sudo","zypper","install","-y","python3-requests"],
+                "sudo zypper install python3-requests"):
+            try:
+                import requests as _r; print(f"  {_G}✓ Installed via zypper{_R}\n"); return _r
+            except ImportError: pass
+
+    # pipx (isolated app install)
+    if _which("pipx"):
+        print(f"  {_Y}Trying pipx{_R}")
+        if _try(["pipx","install","requests"], "pipx install requests"):
+            try:
+                import requests as _r; print(f"  {_G}✓ Installed via pipx{_R}\n"); return _r
+            except ImportError: pass
+
+    # pip with --break-system-packages (PEP 668 override)
+    for pip in ("pip3", "pip"):
+        if _which(pip):
+            print(f"  {_Y}Trying {pip} --break-system-packages{_R}")
+            if _try([pip,"install","--break-system-packages","requests"],
+                    f"{pip} install --break-system-packages requests"):
+                try:
+                    import requests as _r
+                    print(f"  {_G}✓ Installed via {pip}{_R}\n"); return _r
+                except ImportError: pass
+
+    # pip without flag (plain venv / older systems)
+    for pip in ("pip3", "pip"):
+        if _which(pip):
+            print(f"  {_Y}Trying plain {pip}{_R}")
+            if _try([pip,"install","requests"], f"{pip} install requests"):
+                try:
+                    import requests as _r; print(f"  {_G}✓ Installed via {pip}{_R}\n"); return _r
+                except ImportError: pass
+
+    # Nothing worked — print manual instructions and exit
+    print(f"""
+  {_C}All automatic install attempts failed.{_R}
+  Please install 'requests' manually for your system:
+
+    Arch Linux :  sudo pacman -S python-requests
+    Debian/Ubuntu: sudo apt install python3-requests
+    Fedora/RHEL:  sudo dnf install python3-requests
+    Generic pip:  pip install requests --break-system-packages
+    Virtual env:  python -m venv .venv && .venv/bin/pip install requests
+                  then run:  .venv/bin/python {sys.argv[0]} {' '.join(sys.argv[1:])}
+""")
+    sys.exit(1)
+
+requests = _bootstrap_requests()
+
+VERSION    = "0.1.1"
+FIRST_RUN  = Path.home() / ".gitnav_installed"
+INSTALL_TO = "/usr/local/bin/gitnav"
+API_BASE   = "https://api.github.com"
+TIMEOUT    = 15
+
+# ── ANSI colours ──────────────────────────────────────────────────────────────
+class C:
+    RESET="\033[0m";  BOLD="\033[1m";  DIM="\033[2m"
+    RED="\033[31m";   GREEN="\033[32m"; YELLOW="\033[33m"
+    BLUE="\033[34m";  MAGENTA="\033[35m"; CYAN="\033[36m"; WHITE="\033[37m"
+    BRED="\033[91m";  BGREEN="\033[92m"; BYELLOW="\033[93m"
+    BBLUE="\033[94m"; BMAGENTA="\033[95m"; BCYAN="\033[96m"; BWHITE="\033[97m"
+    BG_BBLUE="\033[104m"; BG_BCYAN="\033[106m"
+
+# ── Terminal helpers ───────────────────────────────────────────────────────────
+def term_size():
+    try:
+        data = fcntl.ioctl(1, termios.TIOCGWINSZ, b'\x00'*8)
+        r, c = struct.unpack('hh', data[:4])
+        return max(c, 80), max(r, 24)
+    except Exception:
+        return 120, 40
+
+def clear():       os.system("clear" if os.name != "nt" else "cls")
+def cursor_hide(): print("\033[?25l", end="", flush=True)
+def cursor_show(): print("\033[?25h", end="", flush=True)
+def move_to(r,c):  print(f"\033[{r};{c}H", end="", flush=True)
+def erase_line():  print("\033[2K",  end="", flush=True)
+def alt_screen():  print("\033[?1049h", end="", flush=True)
+def main_screen(): print("\033[?1049l", end="", flush=True)
+
+def strip_ansi(s):   return re.sub(r'\033\[[0-9;]*m', '', s)
+def visible_len(s):  return len(strip_ansi(s))
+def truncate(s, n):
+    p = strip_ansi(s)
+    return p if len(p) <= n else p[:n-1] + "…"
+def fmt_size(b):
+    if b is None: return "—"
+    for u in ("B", "KB", "MB", "GB"):
+        if b < 1024: return f"{b:.0f} {u}"
+        b /= 1024
+    return f"{b:.1f} TB"
+def fmt_num(n):
+    if n is None: return "—"
+    if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:     return f"{n/1_000:.1f}k"
+    return str(n)
+def fmt_date(s):
+    if not s: return "—"
+    try:    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%d")
+    except: return s[:10]
+def ago(s):
+    if not s: return "—"
+    try:
+        sec = (datetime.utcnow() - datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ")).total_seconds()
+        if sec < 60:    return "just now"
+        if sec < 3600:  return f"{int(sec//60)}m ago"
+        if sec < 86400: return f"{int(sec//3600)}h ago"
+        return f"{int(sec//86400)}d ago"
+    except: return s[:10]
+
+# ── GitHub API ────────────────────────────────────────────────────────────────
+class GitHubAPI:
+    def __init__(self, token=None):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Accept":               "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        })
+        if token:
+            self.session.headers["Authorization"] = f"Bearer {token}"
+        self._cache = {}
+
+    def _get(self, url, params=None, no_cache=False):
+        key = url + str(params)
+        if not no_cache and key in self._cache:
+            return self._cache[key]
+        try:
+            r = self.session.get(url, params=params, timeout=TIMEOUT)
+            rem = r.headers.get("X-RateLimit-Remaining")
+            if rem and int(rem) < 5:
+                reset = r.headers.get("X-RateLimit-Reset", "")
+                wait  = max(0, int(reset) - int(time.time())) if reset else 60
+                raise RuntimeError(f"Rate limit nearly exhausted. Resets in {wait}s.")
+            r.raise_for_status()
+            data = r.json()
+            self._cache[key] = data
+            return data
+        except requests.exceptions.Timeout:
+            raise RuntimeError("Request timed out. Check your connection.")
+        except requests.exceptions.ConnectionError:
+            raise RuntimeError("Cannot connect to GitHub API.")
+        except requests.exceptions.HTTPError as e:
+            code = e.response.status_code
+            if code == 404: raise RuntimeError("Not found (404).")
+            if code == 403: raise RuntimeError("Forbidden / rate limited (403).")
+            if code == 401: raise RuntimeError("Bad credentials (401).")
+            raise RuntimeError(f"HTTP {code}")
+
+    def user(self, username):    return self._get(f"{API_BASE}/users/{username}")
+    def repos(self, username, page=1, per_page=100):
+        return self._get(f"{API_BASE}/users/{username}/repos",
+                         params={"per_page": per_page, "page": page, "sort": "updated"})
+    def all_repos(self, username):
+        all_r, page = [], 1
+        while True:
+            batch = self.repos(username, page=page)
+            if not batch: break
+            all_r.extend(batch)
+            if len(batch) < 100: break
+            page += 1
+        return all_r
+    def readme(self, username, repo):
+        try:
+            import base64
+            data = self._get(f"{API_BASE}/repos/{username}/{repo}/readme")
+            return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+        except Exception:
+            return None
+    def issues(self, username, repo, state="open"):
+        return self._get(f"{API_BASE}/repos/{username}/{repo}/issues",
+                         params={"state": state, "per_page": 50})
+    def releases(self, username, repo):
+        return self._get(f"{API_BASE}/repos/{username}/{repo}/releases",
+                         params={"per_page": 20})
+    def rate_limit(self):
+        return self._get(f"{API_BASE}/rate_limit", no_cache=True)
+    def clear_cache(self): self._cache.clear()
+
+# ── Spinner loader ────────────────────────────────────────────────────────────
+class Loader:
+    FRAMES = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+    def __init__(self, msg="Loading"):
+        self.msg   = msg
+        self._stop = threading.Event()
+        self._t    = None
+    def _spin(self):
+        idx = 0
+        while not self._stop.is_set():
+            f = self.FRAMES[idx % len(self.FRAMES)]
+            print(f"\r  {C.BCYAN}{f}{C.RESET} {C.DIM}{self.msg}…{C.RESET}   ", end="", flush=True)
+            idx += 1; time.sleep(0.08)
+        print(f"\r{' '*60}\r", end="", flush=True)
+    def start(self):
+        cursor_hide()
+        self._t = threading.Thread(target=self._spin, daemon=True)
+        self._t.start(); return self
+    def stop(self, ok=True):
+        self._stop.set()
+        if self._t: self._t.join()
+        cursor_show()
+        if ok: print(f"  {C.BGREEN}✓{C.RESET} {self.msg}")
+    def __enter__(self): return self.start()
+    def __exit__(self, *_): self.stop()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BANNER
+# ═══════════════════════════════════════════════════════════════════════════════
+BANNER = f"""
+{C.BCYAN}╔══════════════════════════════════════════════════════════════════════════════╗{C.RESET}
+{C.BCYAN}║{C.RESET}                                                                              {C.BCYAN}║{C.RESET}
+{C.BCYAN}║{C.RESET}  {C.BBLUE} ██████╗ ██╗████████╗███╗   ██╗ █████╗ ██╗   ██╗{C.RESET}                        {C.BCYAN}║{C.RESET}
+{C.BCYAN}║{C.RESET}  {C.BBLUE}██╔════╝ ██║╚══██╔══╝████╗  ██║██╔══██╗██║   ██║{C.RESET}                        {C.BCYAN}║{C.RESET}
+{C.BCYAN}║{C.RESET}  {C.BBLUE}██║  ███╗██║   ██║   ██╔██╗ ██║███████║██║   ██║{C.RESET}                        {C.BCYAN}║{C.RESET}
+{C.BCYAN}║{C.RESET}  {C.BBLUE}██║   ██║██║   ██║   ██║╚██╗██║██╔══██║╚██╗ ██╔╝{C.RESET}   {C.BYELLOW}v{VERSION}{C.RESET}          {C.BCYAN}║{C.RESET}
+{C.BCYAN}║{C.RESET}  {C.BBLUE}╚██████╔╝██║   ██║   ██║ ╚████║██║  ██║ ╚████╔╝{C.RESET}                         {C.BCYAN}║{C.RESET}
+{C.BCYAN}║{C.RESET}  {C.BBLUE} ╚═════╝ ╚═╝   ╚═╝   ╚═╝  ╚═══╝╚═╝  ╚═╝  ╚═══╝{C.RESET}                         {C.BCYAN}║{C.RESET}
+{C.BCYAN}║{C.RESET}                                                                              {C.BCYAN}║{C.RESET}
+{C.BCYAN}║{C.RESET}           {C.BMAGENTA}🚀  Enhanced GitHub Repository Navigator{C.RESET}                      {C.BCYAN}║{C.RESET}
+{C.BCYAN}║{C.RESET}      {C.DIM}oxbv1 | oxborn3  ·  oxborn3.com  ·  contact@oxborn3.com{C.RESET}           {C.BCYAN}║{C.RESET}
+{C.BCYAN}╚══════════════════════════════════════════════════════════════════════════════╝{C.RESET}
+"""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CLI MODE
+# ═══════════════════════════════════════════════════════════════════════════════
+class CLI:
+    MENU = [
+        ("📋","List Repositories",       "list"),
+        ("📋","Detailed Repository List","detail"),
+        ("🔍","Search Repositories",     "search"),
+        ("📊","Repository Statistics",   "stats"),
+        ("📥","Clone Repository",        "clone"),
+        ("📖","View README",             "readme"),
+        ("🐛","View Issues",             "issues"),
+        ("📦","Releases & Downloads",    "releases"),
+        ("🌐","Open in Browser",         "browser"),
+        ("👤","User Profile",            "profile"),
+        ("🔄","Refresh Data",            "refresh"),
+        ("❌","Exit",                    "exit"),
+    ]
+
+    def __init__(self, api, username=""):
+        self.api = api; self.username = username; self.repos = []
+
+    def _sep(self, ch="─", w=None):
+        w = w or min(term_size()[0], 80)
+        print(f"{C.DIM}{ch*w}{C.RESET}")
+
+    def _header(self, title, emoji=""):
+        print(f"\n{C.BCYAN}── {emoji} {C.BOLD}{title}{C.RESET} {C.BCYAN}──{C.RESET}")
+
+    def _info(self, k, v):
+        print(f"  {C.BBLUE}{k:<18}{C.RESET} {v}")
+
+    def _prompt(self, msg, default=""):
+        try:    v = input(f"  {C.BYELLOW}▸{C.RESET} {msg}: ").strip()
+        except (KeyboardInterrupt, EOFError): return default
+        return v or default
+
+    def _load_repos(self, force=False):
+        if not self.repos or force:
+            with Loader(f"Fetching repos for @{self.username}"):
+                self.repos = self.api.all_repos(self.username)
+        return self.repos
+
+    def _pick_repo(self, prompt="Repository name"):
+        repos = self._load_repos()
+        if not repos:
+            print(f"  {C.BRED}No repositories found.{C.RESET}"); return None
+        name = self._prompt(prompt + " (name or # number)")
+        if name.isdigit():
+            idx = int(name) - 1
+            if 0 <= idx < len(repos): return repos[idx]["name"]
+        for r in repos:
+            if r["name"] == name: return name
+        matches = [r["name"] for r in repos if name.lower() in r["name"].lower()]
+        if len(matches) == 1: return matches[0]
+        if matches:
+            print(f"  {C.BYELLOW}Matches:{C.RESET} " + ", ".join(matches[:8]))
+        return name or None
+
+    def ask_username(self):
+        print()
+        while True:
+            u = self._prompt("GitHub username")
+            if not u: continue
+            with Loader(f"Verifying @{u}"):
+                try:
+                    self.api.user(u); self.username = u
+                    print(f"  {C.BGREEN}✓{C.RESET} Loaded profile for {C.BOLD}@{u}{C.RESET}"); return
+                except Exception as e:
+                    print(f"  {C.BRED}✗{C.RESET} {e}")
+
+    def run(self):
+        clear(); print(BANNER)
+        if not self.username: self.ask_username()
+        while True:
+            self._show_menu()
+            choice = self._prompt("Choice", "0")
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(self.MENU):
+                    self._dispatch(self.MENU[idx][2]); continue
+            print(f"  {C.BRED}Invalid choice.{C.RESET}")
+
+    def _show_menu(self):
+        print(f"\n  {C.BCYAN}╔{'═'*46}╗{C.RESET}")
+        uline = f"  @{self.username}"
+        pad   = max(0, 44 - len(uline))
+        print(f"  {C.BCYAN}║{C.RESET} {C.BOLD}{uline}{C.RESET}{' '*pad} {C.BCYAN}║{C.RESET}")
+        print(f"  {C.BCYAN}╠{'═'*46}╣{C.RESET}")
+        for i, (emoji, label, _) in enumerate(self.MENU, 1):
+            col = C.BRED if emoji == "❌" else C.BWHITE
+            n   = f"{C.DIM}{i:>2}{C.RESET}"
+            line = f"{col}{label:<33}{C.RESET}"
+            print(f"  {C.BCYAN}║{C.RESET}  {n}  {emoji}  {line}{C.BCYAN}║{C.RESET}")
+        print(f"  {C.BCYAN}╚{'═'*46}╝{C.RESET}")
+
+    def _dispatch(self, action):
+        try:    getattr(self, f"_do_{action}")()
+        except RuntimeError as e: print(f"\n  {C.BRED}⚠  {e}{C.RESET}")
+        except KeyboardInterrupt:  print(f"\n  {C.DIM}Cancelled.{C.RESET}")
+        input(f"\n  {C.DIM}[Enter to continue]{C.RESET}")
+
+    # ── CLI Actions ────────────────────────────────────────────────────────────
+    def _do_list(self):
+        repos = self._load_repos()
+        self._header("Repositories", "📋"); self._sep()
+        for i, r in enumerate(repos, 1):
+            lang  = f"{C.BBLUE}[{(r.get('language') or '—'):>10}]{C.RESET}"
+            stars = f"{C.BYELLOW}★{fmt_num(r.get('stargazers_count',0)):<5}{C.RESET}"
+            name  = f"{C.BWHITE}{r['name']}{C.RESET}"
+            priv  = f" {C.BRED}[private]{C.RESET}" if r.get("private") else ""
+            print(f"  {C.DIM}{i:>3}.{C.RESET}  {lang}  {stars}  {name}{priv}")
+        self._sep()
+        print(f"  {C.DIM}{len(repos)} repositories{C.RESET}")
+
+    def _do_detail(self):
+        repos = self._load_repos()
+        self._header("Detailed Repository List", "📋")
+        for r in repos:
+            lang = r.get("language") or "—"
+            stars= r.get("stargazers_count", 0)
+            forks= r.get("forks_count", 0)
+            size = fmt_size((r.get("size") or 0) * 1024)
+            upd  = ago(r.get("updated_at"))
+            desc = (r.get("description") or "No description")[:65]
+            priv = f" {C.BRED}🔒{C.RESET}" if r.get("private") else ""
+            print(f"\n  {C.BOLD}{C.BWHITE}{r['name']}{C.RESET}{priv}")
+            print(f"  {C.DIM}{desc}{C.RESET}")
+            print(f"  {C.BYELLOW}★{stars}{C.RESET}  {C.BCYAN}⑂{forks}{C.RESET}  "
+                  f"{C.BBLUE}[{lang}]{C.RESET}  {C.DIM}{size} · {upd}{C.RESET}")
+            self._sep("·", 60)
+
+    def _do_search(self):
+        self._header("Search Repositories", "🔍")
+        repos = self._load_repos()
+        q = self._prompt("Search (name / description / language)")
+        if not q: return
+        ql   = q.lower()
+        hits = [r for r in repos if
+                ql in (r.get("name") or "").lower() or
+                ql in (r.get("description") or "").lower() or
+                ql in (r.get("language") or "").lower()]
+        print(f"\n  {C.BGREEN}{len(hits)}{C.RESET} match(es) for {C.BYELLOW}'{q}'{C.RESET}\n")
+        for r in hits:
+            desc = truncate(r.get("description") or "—", 55)
+            print(f"  {C.BWHITE}{r['name']:<35}{C.RESET}  "
+                  f"{C.BBLUE}[{(r.get('language') or '—'):<10}]{C.RESET}  "
+                  f"{C.DIM}{desc}{C.RESET}")
+
+    def _do_stats(self):
+        repos = self._load_repos()
+        self._header("Repository Statistics", "📊")
+        total_stars = sum(r.get("stargazers_count",0) for r in repos)
+        total_forks = sum(r.get("forks_count",0) for r in repos)
+        total_size  = sum((r.get("size") or 0) for r in repos) * 1024
+        langs       = defaultdict(int)
+        for r in repos:
+            l = r.get("language")
+            if l: langs[l] += 1
+        public = sum(1 for r in repos if not r.get("private"))
+        print(f"\n  {C.BBLUE}Total repos  {C.RESET} {len(repos)}")
+        print(f"  {C.BYELLOW}Total stars  {C.RESET} {fmt_num(total_stars)}")
+        print(f"  {C.BCYAN}Total forks  {C.RESET} {fmt_num(total_forks)}")
+        print(f"  {C.BMAGENTA}Total size   {C.RESET} {fmt_size(total_size)}")
+        print(f"  {C.BGREEN}Public       {C.RESET} {public}")
+        print(f"  {C.BRED}Private      {C.RESET} {len(repos)-public}")
+        if langs:
+            print(f"\n  {C.BOLD}Language breakdown:{C.RESET}")
+            top = sorted(langs.items(), key=lambda x: -x[1])[:12]
+            bw  = 28; mx = max(v for _,v in top)
+            for lang, cnt in top:
+                filled = round(bw * cnt / mx)
+                bar = f"{C.BBLUE}{'█'*filled}{C.DIM}{'░'*(bw-filled)}{C.RESET}"
+                print(f"  {lang:<16} {bar} {cnt}")
+
+    def _do_clone(self):
+        self._header("Clone Repository", "📥")
+        repo = self._pick_repo("Repository to clone")
+        if not repo: return
+        dest = self._prompt("Destination directory", ".")
+        url  = f"https://github.com/{self.username}/{repo}.git"
+        path = os.path.join(dest, repo)
+        print(f"\n  {C.DIM}Cloning {url}{C.RESET}")
+        try:
+            proc = subprocess.Popen(["git","clone","--progress",url,path],
+                                    stderr=subprocess.PIPE, text=True)
+            for line in proc.stderr:
+                print(f"  {C.DIM}{line.rstrip()}{C.RESET}")
+            proc.wait()
+            if proc.returncode == 0: print(f"  {C.BGREEN}✓ Cloned to {path}{C.RESET}")
+            else:                     print(f"  {C.BRED}✗ Clone failed (exit {proc.returncode}){C.RESET}")
+        except FileNotFoundError:
+            raise RuntimeError("git not found. Please install git.")
+
+    def _do_readme(self):
+        self._header("View README", "📖")
+        repo = self._pick_repo("Repository")
+        if not repo: return
+        with Loader(f"Fetching README for {repo}"):
+            content = self.api.readme(self.username, repo)
+        if not content:
+            print(f"  {C.BRED}No README found.{C.RESET}"); return
+        print(f"\n{C.DIM}{'─'*70}{C.RESET}")
+        for line in content.split("\n"):
+            if line.startswith("### "):   print(f"  {C.BBLUE}{C.BOLD}{line[4:]}{C.RESET}")
+            elif line.startswith("## "): print(f"  {C.BCYAN}{C.BOLD}{line[3:]}{C.RESET}")
+            elif line.startswith("# "):  print(f"\n  {C.BMAGENTA}{C.BOLD}{line[2:]}{C.RESET}\n")
+            elif line.startswith("```"): print(f"  {C.DIM}{line}{C.RESET}")
+            elif line.startswith(("- ","* ")): print(f"  {C.BYELLOW}•{C.RESET} {line[2:]}")
+            else:
+                w = term_size()[0] - 6
+                for chunk in textwrap.wrap(line, w) or [""]: print(f"  {chunk}")
+        print(f"{C.DIM}{'─'*70}{C.RESET}")
+
+    def _do_issues(self):
+        self._header("View Issues", "🐛")
+        repo = self._pick_repo("Repository")
+        if not repo: return
+        state = self._prompt("State [open/closed/all]", "open")
+        with Loader(f"Fetching {state} issues"):
+            issues = self.api.issues(self.username, repo, state)
+        if not issues:
+            print(f"  {C.DIM}No {state} issues.{C.RESET}"); return
+        self._sep()
+        for iss in issues:
+            num   = f"{C.DIM}#{iss['number']}{C.RESET}"
+            title = truncate(iss.get("title",""), 55)
+            user  = iss.get("user",{}).get("login","?")
+            upd   = ago(iss.get("updated_at"))
+            col   = C.BGREEN if iss.get("state")=="open" else C.BRED
+            icon  = "●" if iss.get("state")=="open" else "✕"
+            labels = " ".join(f"[{l['name']}]" for l in iss.get("labels",[])[:3])
+            print(f"  {col}{icon}{C.RESET}  {num}  {C.BWHITE}{title:<55}{C.RESET}  "
+                  f"{C.BBLUE}{labels}{C.RESET}  {C.DIM}@{user} · {upd}{C.RESET}")
+        self._sep()
+        print(f"  {C.DIM}{len(issues)} issues shown{C.RESET}")
+
+    def _do_releases(self):
+        self._header("Releases & Downloads", "📦")
+        repo = self._pick_repo("Repository")
+        if not repo: return
+        with Loader("Fetching releases"):
+            releases = self.api.releases(self.username, repo)
+        if not releases:
+            print(f"  {C.DIM}No releases found.{C.RESET}"); return
+        for rel in releases:
+            tag  = rel.get("tag_name","?")
+            name = rel.get("name") or tag
+            pub  = fmt_date(rel.get("published_at"))
+            pre  = f" {C.BYELLOW}[pre-release]{C.RESET}" if rel.get("prerelease") else ""
+            print(f"\n  {C.BWHITE}{C.BOLD}{name}{C.RESET}  {C.DIM}{tag} · {pub}{C.RESET}{pre}")
+            if rel.get("body"):
+                print(f"  {C.DIM}{(rel['body'] or '')[:100].replace(chr(10),' ')}…{C.RESET}")
+            for a in rel.get("assets",[]):
+                sz  = fmt_size(a.get("size"))
+                dl  = fmt_num(a.get("download_count",0))
+                print(f"    {C.BCYAN}↓{C.RESET}  {a['name']:<40}  {C.DIM}{sz} · {dl} downloads{C.RESET}")
+                want = self._prompt(f"Download {a['name']}? [y/N]","n")
+                if want.lower()=="y":
+                    dest  = self._prompt("Save to",".")
+                    fpath = os.path.join(dest, a["name"])
+                    self._download(a["browser_download_url"], fpath)
+
+    def _download(self, url, path):
+        print(f"  {C.DIM}Downloading to {path}…{C.RESET}")
+        try:
+            with requests.get(url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("Content-Length",0))
+                done  = 0
+                with open(path,"wb") as f:
+                    for chunk in r.iter_content(65536):
+                        f.write(chunk); done += len(chunk)
+                        if total:
+                            pct = done/total; bar = int(30*pct)
+                            print(f"\r  [{'█'*bar}{'░'*(30-bar)}] {pct*100:.0f}%",end="",flush=True)
+            print(f"\n  {C.BGREEN}✓ Saved to {path}{C.RESET}")
+        except Exception as e:
+            print(f"\n  {C.BRED}✗ Download failed: {e}{C.RESET}")
+
+    def _do_browser(self):
+        self._header("Open in Browser","🌐")
+        repo = self._pick_repo("Repository (Enter for profile)")
+        url  = f"https://github.com/{self.username}/{repo}" if repo else f"https://github.com/{self.username}"
+        print(f"  {C.DIM}Opening {url}{C.RESET}"); webbrowser.open(url)
+
+    def _do_profile(self):
+        self._header("User Profile","👤")
+        u = self._prompt("GitHub username", self.username)
+        with Loader(f"Fetching @{u}"):
+            p = self.api.user(u)
+        self._sep()
+        self._info("Login",         f"{C.BWHITE}{p.get('login')}{C.RESET}")
+        self._info("Name",          p.get("name") or "—")
+        self._info("Bio",           p.get("bio") or "—")
+        self._info("Location",      p.get("location") or "—")
+        self._info("Company",       p.get("company") or "—")
+        self._info("Blog",          p.get("blog") or "—")
+        self._info("Twitter",       f"@{p['twitter_username']}" if p.get("twitter_username") else "—")
+        self._info("Repos (public)",fmt_num(p.get("public_repos")))
+        self._info("Gists",         fmt_num(p.get("public_gists")))
+        self._info("Followers",     fmt_num(p.get("followers")))
+        self._info("Following",     fmt_num(p.get("following")))
+        self._info("Member since",  fmt_date(p.get("created_at")))
+        self._sep()
+
+    def _do_refresh(self):
+        print(f"\n  {C.DIM}Clearing cache and reloading…{C.RESET}")
+        self.api.clear_cache(); self.repos = []
+        self._load_repos(force=True)
+        print(f"  {C.BGREEN}✓ Data refreshed.{C.RESET}")
+
+    def _do_exit(self):
+        print(f"\n  {C.BCYAN}Thanks for using GitNav. Goodbye!{C.RESET}\n"); sys.exit(0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TUI MODE  (full-screen interactive)
+# ═══════════════════════════════════════════════════════════════════════════════
+class TUI:
+    SIDEBAR_W = 30
+    MENU_ITEMS = [
+        ("📋","List Repos"),
+        ("📋","Detailed List"),
+        ("🔍","Search"),
+        ("📊","Statistics"),
+        ("📥","Clone"),
+        ("📖","View README"),
+        ("🐛","Issues"),
+        ("📦","Releases"),
+        ("🌐","Open Browser"),
+        ("👤","User Profile"),
+        ("🔄","Refresh"),
+        ("❌","Exit"),
+    ]
+
+    def __init__(self, api, username=""):
+        self.api      = api
+        self.username = username
+        self.repos    = []
+        self.sel      = 0
+        self.content  = []
+        self.scroll   = 0
+        self.status   = ""
+        self.cols, self.rows = term_size()
+        signal.signal(signal.SIGWINCH, self._on_resize)
+
+    def _on_resize(self, *_):
+        self.cols, self.rows = term_size()
+        self._full_redraw()
+
+    # ── Raw keyboard input ─────────────────────────────────────────────────────
+    def _getch(self):
+        import tty
+        fd  = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            if ch == "\033":
+                ch2 = sys.stdin.read(1)
+                if ch2 == "[":
+                    ch3 = sys.stdin.read(1)
+                    if ch3 in ("5","6"):  # PgUp/Dn have trailing ~
+                        sys.stdin.read(1)
+                    return f"\033[{ch3}"
+                return ch + ch2
+            return ch
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    def _readline_raw(self, prompt=""):
+        """Read a line without echo disrupting the TUI."""
+        import tty
+        fd  = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        buf = []
+        cursor_show()
+        print(f"{C.BYELLOW}{prompt}{C.RESET}", end="", flush=True)
+        try:
+            tty.setraw(fd)
+            while True:
+                ch = sys.stdin.read(1)
+                if ch in ("\r","\n"): break
+                if ch in ("\x7f","\x08"):
+                    if buf: buf.pop(); print("\b \b",end="",flush=True)
+                elif ch == "\x03": buf=[]; break
+                elif ord(ch)>=32: buf.append(ch); print(ch,end="",flush=True)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        cursor_hide()
+        return "".join(buf)
+
+    # ── Layout helpers ─────────────────────────────────────────────────────────
+    def _content_rect(self):
+        """(top_row, left_col, height, width)"""
+        return 4, self.SIDEBAR_W + 2, self.rows - 5, self.cols - self.SIDEBAR_W - 3
+
+    def _ask(self, question, default=""):
+        """Inline prompt at bottom of content area."""
+        tr, lc, h, _ = self._content_rect()
+        pr = tr + h - 1
+        move_to(pr, lc); erase_line()
+        ans = self._readline_raw(f"  {question}: ")
+        move_to(pr, lc); erase_line()
+        return ans or default
+
+    def _repo_picker(self, prompt="Repo name or # number"):
+        if not self.repos: return None
+        val = self._ask(prompt)
+        if not val: return None
+        if val.isdigit():
+            idx = int(val)-1
+            if 0<=idx<len(self.repos): return self.repos[idx]["name"]
+        for r in self.repos:
+            if r["name"]==val: return val
+        matches = [r["name"] for r in self.repos if val.lower() in r["name"].lower()]
+        if len(matches)==1: return matches[0]
+        if matches:
+            self._set_content(
+                [f"{C.BYELLOW}Did you mean:{C.RESET}"] +
+                [f"  {m}" for m in matches[:10]] +
+                ["", f"  {C.DIM}Enter exact name or number{C.RESET}"]
+            )
+            return self._ask("Exact name")
+        return val
+
+    # ── Threaded loader animation ──────────────────────────────────────────────
+    def _run_with_loader(self, msg, fn, *args, **kwargs):
+        FRAMES = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+        result = [None]; error = [None]; done = threading.Event()
+
+        def worker():
+            try:    result[0] = fn(*args, **kwargs)
+            except Exception as e: error[0] = e
+            finally: done.set()
+
+        threading.Thread(target=worker, daemon=True).start()
+        tr, lc, h, w = self._content_rect()
+        cr = tr + h//2
+        cc = lc + max(0, (w-len(msg)-10)//2)
+        idx = 0
+        while not done.is_set():
+            f = FRAMES[idx % len(FRAMES)]
+            move_to(cr, cc)
+            print(f"{C.BCYAN}{f}{C.RESET}  {C.DIM}{msg}…{C.RESET}      ", end="", flush=True)
+            idx += 1; time.sleep(0.08)
+        move_to(cr, cc); print(" "*(len(msg)+20), end="", flush=True)
+        if error[0]: raise error[0]
+        return result[0]
+
+    # ── Drawing ────────────────────────────────────────────────────────────────
+    def _draw_frame(self):
+        w, h = self.cols, self.rows
+        sw   = self.SIDEBAR_W
+        A    = C.BCYAN; R = C.RESET
+
+        # Outer border
+        move_to(1,1); print(f"{A}╔{'═'*(w-2)}╗{R}",end="",flush=True)
+        for r in range(2,h+1):
+            move_to(r,1);  print(f"{A}║{R}",end="",flush=True)
+            move_to(r,w);  print(f"{A}║{R}",end="",flush=True)
+        move_to(h,1); print(f"{A}╚{'═'*(w-2)}╝{R}",end="",flush=True)
+
+        # Title bar (row 2)
+        title = f" 🚀 GitNav v{VERSION} "
+        user  = f" @{self.username} " if self.username else ""
+        gap   = " " * max(0, w-4-len(title)-len(user))
+        move_to(2,2)
+        print(f"{C.BG_BBLUE}{C.BWHITE}{C.BOLD}{title}{C.RESET}{C.DIM}{gap}{A}{user}{R}", end="", flush=True)
+
+        # Divider row 3
+        move_to(3,1); print(f"{A}╠{'═'*sw}╦{'═'*(w-sw-3)}╣{R}",end="",flush=True)
+
+        # Sidebar divider
+        for r in range(4, h):
+            move_to(r, sw+1); print(f"{A}║{R}",end="",flush=True)
+
+        # Status bar row
+        move_to(h-1,1); print(f"{A}╠{'═'*(w-2)}╣{R}",end="",flush=True)
+        move_to(h,2)
+        keys = (f" {C.DIM}↑↓{R} nav  {C.DIM}Enter{R} select  "
+                f"{C.DIM}PgUp/Dn{R} scroll  {C.DIM}r{R} refresh  {C.DIM}q{R} quit")
+        stat = f"  {C.BYELLOW}{self.status[:w-80]}{R}" if self.status else ""
+        print(f"{keys}{stat}", end="", flush=True)
+
+    def _draw_sidebar(self):
+        sw = self.SIDEBAR_W
+        move_to(4,2); print(f"{C.DIM} MENU{C.RESET}",end="",flush=True)
+        for i,(emoji,label) in enumerate(self.MENU_ITEMS):
+            r = 5 + i
+            if r >= self.rows-2: break
+            move_to(r,2)
+            if i == self.sel:
+                print(f"{C.BG_BBLUE}{C.BWHITE}{C.BOLD} {emoji} {label:<{sw-6}} {C.RESET}",end="",flush=True)
+            else:
+                col = C.BRED if emoji=="❌" else C.DIM
+                print(f"{col} {emoji} {label:<{sw-6}}{C.RESET}",end="",flush=True)
+
+    def _draw_content(self):
+        tr, lc, h, w = self._content_rect()
+        visible = self.content[self.scroll : self.scroll+h]
+        for i, line in enumerate(visible):
+            move_to(tr+i, lc); erase_line()
+            print(truncate(line, w), end="", flush=True)
+        for i in range(len(visible), h):
+            move_to(tr+i, lc); erase_line()
+
+    def _set_content(self, lines):
+        self.content = lines; self.scroll = 0; self._draw_content()
+
+    def _full_redraw(self):
+        self.cols, self.rows = term_size()
+        self._draw_frame(); self._draw_sidebar(); self._draw_content()
+
+    # ── Content builders ───────────────────────────────────────────────────────
+    def _c_list(self):
+        lines = [f"{C.BBLUE}{C.BOLD}  📋 Repositories — @{self.username}{C.RESET}",""]
+        for i,r in enumerate(self.repos,1):
+            lang  = f"{C.BBLUE}[{(r.get('language') or '—'):>10}]{C.RESET}"
+            stars = f"{C.BYELLOW}★{fmt_num(r.get('stargazers_count',0)):<5}{C.RESET}"
+            name  = f"{C.BWHITE}{r['name']}{C.RESET}"
+            priv  = f" {C.BRED}[priv]{C.RESET}" if r.get("private") else ""
+            lines.append(f"  {C.DIM}{i:>3}.{C.RESET}  {lang}  {stars}  {name}{priv}")
+        lines += ["", f"  {C.DIM}{len(self.repos)} total{C.RESET}"]
+        return lines
+
+    def _c_detail(self):
+        lines = [f"{C.BBLUE}{C.BOLD}  📋 Detailed Repository List{C.RESET}",""]
+        for r in self.repos:
+            lang = r.get("language") or "—"; stars=r.get("stargazers_count",0)
+            forks=r.get("forks_count",0); size=fmt_size((r.get("size") or 0)*1024)
+            upd  = ago(r.get("updated_at")); desc=(r.get("description") or "No description")[:70]
+            priv = f" {C.BRED}🔒{C.RESET}" if r.get("private") else ""
+            lines.append(f"  {C.BOLD}{C.BWHITE}{r['name']}{C.RESET}{priv}")
+            lines.append(f"  {C.DIM}{desc}{C.RESET}")
+            lines.append(f"  {C.BYELLOW}★{stars}{C.RESET}  {C.BCYAN}⑂{forks}{C.RESET}  "
+                         f"{C.BBLUE}[{lang}]{C.RESET}  {C.DIM}{size} · {upd}{C.RESET}")
+            lines.append(f"  {C.DIM}{'·'*60}{C.RESET}")
+        return lines
+
+    def _c_stats(self):
+        total_stars = sum(r.get("stargazers_count",0) for r in self.repos)
+        total_forks = sum(r.get("forks_count",0) for r in self.repos)
+        total_size  = sum((r.get("size") or 0) for r in self.repos)*1024
+        langs = defaultdict(int)
+        for r in self.repos:
+            l=r.get("language")
+            if l: langs[l]+=1
+        public = sum(1 for r in self.repos if not r.get("private"))
+        lines  = [f"{C.BBLUE}{C.BOLD}  📊 Repository Statistics{C.RESET}",""]
+        lines += [
+            f"  {C.BBLUE}Total repos  {C.RESET} {len(self.repos)}",
+            f"  {C.BYELLOW}Total stars  {C.RESET} {fmt_num(total_stars)}",
+            f"  {C.BCYAN}Total forks  {C.RESET} {fmt_num(total_forks)}",
+            f"  {C.BMAGENTA}Total size   {C.RESET} {fmt_size(total_size)}",
+            f"  {C.BGREEN}Public       {C.RESET} {public}",
+            f"  {C.BRED}Private      {C.RESET} {len(self.repos)-public}",
+        ]
+        if langs:
+            lines += ["", f"  {C.BOLD}Language breakdown:{C.RESET}"]
+            top = sorted(langs.items(),key=lambda x:-x[1])[:15]
+            bw  = 25; mx=max(v for _,v in top)
+            for lang,cnt in top:
+                filled = round(bw*cnt/mx)
+                bar = f"{C.BBLUE}{'█'*filled}{C.DIM}{'░'*(bw-filled)}{C.RESET}"
+                lines.append(f"  {lang:<16} {bar} {cnt}")
+        return lines
+
+    def _c_profile(self, p):
+        lines=[f"{C.BBLUE}{C.BOLD}  👤 User Profile{C.RESET}",""]
+        fields=[
+            ("Login",p.get("login")),("Name",p.get("name") or "—"),
+            ("Bio",p.get("bio") or "—"),("Location",p.get("location") or "—"),
+            ("Company",p.get("company") or "—"),("Blog",p.get("blog") or "—"),
+            ("Twitter",f"@{p['twitter_username']}" if p.get("twitter_username") else "—"),
+            ("Public Repos",fmt_num(p.get("public_repos"))),
+            ("Gists",fmt_num(p.get("public_gists"))),
+            ("Followers",fmt_num(p.get("followers"))),
+            ("Following",fmt_num(p.get("following"))),
+            ("Member since",fmt_date(p.get("created_at"))),
+        ]
+        for k,v in fields:
+            lines.append(f"  {C.BBLUE}{k:<16}{C.RESET} {v}")
+        return lines
+
+    def _c_issues(self, issues, state):
+        lines=[f"{C.BBLUE}{C.BOLD}  🐛 Issues ({state}){C.RESET}",""]
+        if not issues:
+            lines.append(f"  {C.DIM}No {state} issues found.{C.RESET}"); return lines
+        for iss in issues:
+            num  = f"{C.DIM}#{iss['number']}{C.RESET}"
+            title= truncate(iss.get("title",""),65)
+            user = iss.get("user",{}).get("login","?")
+            upd  = ago(iss.get("updated_at"))
+            col  = C.BGREEN if iss.get("state")=="open" else C.BRED
+            icon = "●" if iss.get("state")=="open" else "✕"
+            lines.append(f"  {col}{icon}{C.RESET} {num}  {C.BWHITE}{title}{C.RESET}")
+            lines.append(f"       {C.DIM}@{user} · {upd}{C.RESET}")
+            lines.append("")
+        return lines
+
+    def _c_releases(self, releases):
+        lines=[f"{C.BBLUE}{C.BOLD}  📦 Releases{C.RESET}",""]
+        for rel in releases:
+            tag  = rel.get("tag_name","?"); name=rel.get("name") or tag
+            pub  = fmt_date(rel.get("published_at"))
+            pre  = f" {C.BYELLOW}[pre-release]{C.RESET}" if rel.get("prerelease") else ""
+            lines.append(f"  {C.BOLD}{C.BWHITE}{name}{C.RESET}  {C.DIM}{tag} · {pub}{C.RESET}{pre}")
+            if rel.get("body"):
+                lines.append(f"  {C.DIM}{(rel['body'] or '')[:100].replace(chr(10),' ')}{C.RESET}")
+            for a in rel.get("assets",[]):
+                sz=fmt_size(a.get("size")); dl=fmt_num(a.get("download_count",0))
+                lines.append(f"    {C.BCYAN}↓{C.RESET}  {a['name']:<40}  {C.DIM}{sz} · {dl} dl{C.RESET}")
+            lines.append("")
+        return lines
+
+    def _c_readme(self, content):
+        lines=[f"{C.BBLUE}{C.BOLD}  📖 README{C.RESET}",""]
+        if not content:
+            lines.append(f"  {C.BRED}No README found.{C.RESET}"); return lines
+        for line in content.split("\n"):
+            if line.startswith("### "):   lines.append(f"  {C.BBLUE}{C.BOLD}{line[4:]}{C.RESET}")
+            elif line.startswith("## "): lines.append(f"  {C.BCYAN}{C.BOLD}{line[3:]}{C.RESET}")
+            elif line.startswith("# "):  lines.append(f"  {C.BMAGENTA}{C.BOLD}{line[2:]}{C.RESET}")
+            elif line.startswith("```"): lines.append(f"  {C.DIM}{line}{C.RESET}")
+            elif line.startswith(("- ","* ")): lines.append(f"  {C.BYELLOW}•{C.RESET} {line[2:]}")
+            else: lines.append(f"  {line}")
+        return lines
+
+    # ── Dispatch ───────────────────────────────────────────────────────────────
+    def _ensure_repos(self):
+        if not self.repos:
+            self.repos = self._run_with_loader(
+                f"Fetching repos for @{self.username}",
+                self.api.all_repos, self.username)
+
+    def _dispatch(self):
+        action = self.MENU_ITEMS[self.sel][1]
+
+        if action == "Exit":
+            self._quit()
+
+        elif action == "List Repos":
+            self._ensure_repos(); self._set_content(self._c_list())
+
+        elif action == "Detailed List":
+            self._ensure_repos(); self._set_content(self._c_detail())
+
+        elif action == "Search":
+            self._ensure_repos()
+            q = self._ask("Search term (name / desc / lang)")
+            if not q: return
+            ql   = q.lower()
+            hits = [r for r in self.repos if
+                    ql in (r.get("name") or "").lower() or
+                    ql in (r.get("description") or "").lower() or
+                    ql in (r.get("language") or "").lower()]
+            lines=[f"{C.BBLUE}{C.BOLD}  🔍 Search: '{q}'{C.RESET}",""]
+            if not hits: lines.append(f"  {C.DIM}No matches.{C.RESET}")
+            for r in hits:
+                desc=truncate(r.get("description") or "—",55)
+                lines.append(f"  {C.BWHITE}{r['name']:<36}{C.RESET}"
+                             f"{C.BBLUE}[{(r.get('language') or '—'):<10}]{C.RESET}  "
+                             f"{C.DIM}{desc}{C.RESET}")
+            self._set_content(lines)
+
+        elif action == "Statistics":
+            self._ensure_repos(); self._set_content(self._c_stats())
+
+        elif action == "Clone":
+            self._ensure_repos()
+            repo = self._repo_picker("Repo to clone (name or #)")
+            if not repo: return
+            dest = self._ask("Destination directory",".")
+            url  = f"https://github.com/{self.username}/{repo}.git"
+            path = os.path.join(dest, repo)
+            lines=[f"{C.BBLUE}{C.BOLD}  📥 Clone: {repo}{C.RESET}","",
+                   f"  {C.DIM}Cloning {url}{C.RESET}",
+                   f"  {C.DIM}Into    {path}{C.RESET}",""]
+            try:
+                proc=subprocess.run(["git","clone","--progress",url,path],
+                                    capture_output=True,text=True)
+                for line in proc.stderr.split("\n"): lines.append(f"  {C.DIM}{line}{C.RESET}")
+                if proc.returncode==0: lines.append(f"  {C.BGREEN}✓ Clone complete!{C.RESET}")
+                else: lines.append(f"  {C.BRED}✗ Failed (exit {proc.returncode}){C.RESET}")
+            except FileNotFoundError:
+                lines.append(f"  {C.BRED}git not found. Please install git.{C.RESET}")
+            self._set_content(lines)
+
+        elif action == "View README":
+            self._ensure_repos()
+            repo = self._repo_picker("Repo for README")
+            if not repo: return
+            content = self._run_with_loader(f"Fetching README for {repo}",
+                                            self.api.readme, self.username, repo)
+            self._set_content(self._c_readme(content))
+
+        elif action == "Issues":
+            self._ensure_repos()
+            repo  = self._repo_picker("Repo for issues")
+            if not repo: return
+            state = self._ask("State [open/closed/all]","open")
+            issues= self._run_with_loader(f"Fetching {state} issues",
+                                          self.api.issues, self.username, repo, state)
+            self._set_content(self._c_issues(issues, state))
+
+        elif action == "Releases":
+            self._ensure_repos()
+            repo = self._repo_picker("Repo for releases")
+            if not repo: return
+            rels = self._run_with_loader(f"Fetching releases for {repo}",
+                                         self.api.releases, self.username, repo)
+            self._set_content(self._c_releases(rels))
+
+        elif action == "Open Browser":
+            self._ensure_repos()
+            repo = self._ask("Repo name (blank = profile page)","")
+            url  = (f"https://github.com/{self.username}/{repo}"
+                    if repo else f"https://github.com/{self.username}")
+            webbrowser.open(url)
+            self._set_content([f"{C.BBLUE}{C.BOLD}  🌐 Opened in Browser{C.RESET}","",
+                               f"  {C.BGREEN}✓{C.RESET} {url}"])
+
+        elif action == "User Profile":
+            u = self._ask("GitHub username", self.username)
+            p = self._run_with_loader(f"Fetching @{u}", self.api.user, u)
+            self._set_content(self._c_profile(p))
+
+        elif action == "Refresh":
+            self.api.clear_cache(); self.repos=[]
+            self._ensure_repos()
+            self._set_content([f"{C.BBLUE}{C.BOLD}  🔄 Data Refreshed{C.RESET}","",
+                               f"  {C.BGREEN}✓ Cache cleared · {len(self.repos)} repos reloaded.{C.RESET}"])
+
+    # ── Animated login splash ──────────────────────────────────────────────────
+    def _login_splash(self):
+        clear()
+        w, h = self.cols, self.rows
+        LOGO = [
+            "  ██████╗ ██╗████████╗███╗   ██╗ █████╗ ██╗   ██╗",
+            " ██╔════╝ ██║╚══██╔══╝████╗  ██║██╔══██╗██║   ██║",
+            " ██║  ███╗██║   ██║   ██╔██╗ ██║███████║██║   ██║",
+            " ██║   ██║██║   ██║   ██║╚██╗██║██╔══██║╚██╗ ██╔╝",
+            " ╚██████╔╝██║   ██║   ██║ ╚████║██║  ██║ ╚████╔╝ ",
+            "  ╚═════╝ ╚═╝   ╚═╝   ╚═╝  ╚═══╝╚═╝  ╚═╝  ╚═══╝  ",
+        ]
+        COLS = [C.BCYAN, C.BBLUE, C.BMAGENTA, C.BBLUE, C.BCYAN, C.DIM]
+        sr   = max(1, h//2 - 7)
+
+        # Stream logo characters
+        for li, line in enumerate(LOGO):
+            move_to(sr+li, max(1, (w-len(line))//2))
+            for ch in line:
+                print(f"{COLS[li]}{ch}{C.RESET}", end="", flush=True)
+                time.sleep(0.003)
+
+        # Tagline
+        for row_off, text, col in [
+            (7, f"🚀 Enhanced GitHub Repository Navigator  v{VERSION}", C.BMAGENTA),
+            (8, "oxbv1 | oxborn3  ·  oxborn3.com  ·  contact@oxborn3.com", C.DIM),
+        ]:
+            move_to(sr+row_off, max(1, (w-len(text))//2))
+            print(f"{col}{text}{C.RESET}", flush=True)
+
+        # Progress bar
+        bw  = 42
+        br  = sr + 10
+        bc  = max(1, (w-bw-6)//2)
+        for i in range(bw+1):
+            move_to(br, bc)
+            filled = "█"*i + "░"*(bw-i)
+            pct    = int(100*i/bw)
+            print(f"{C.BCYAN}{filled}{C.RESET} {C.DIM}{pct:>3}%{C.RESET}", end="", flush=True)
+            time.sleep(0.025)
+        print()
+
+        # Username input
+        prompt_r = br + 2
+        while True:
+            move_to(prompt_r,   max(1,(w-42)//2))
+            print(f"{C.BWHITE}  GitHub username:{C.RESET} " + " "*30, end="", flush=True)
+            move_to(prompt_r,   max(1,(w-42)//2)+18)
+            cursor_show()
+
+            import tty
+            fd  = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            buf = []
+            try:
+                tty.setraw(fd)
+                while True:
+                    ch = sys.stdin.read(1)
+                    if ch in ("\r","\n"): break
+                    if ch in ("\x7f","\x08"):
+                        if buf: buf.pop(); print("\b \b",end="",flush=True)
+                    elif ord(ch)>=32: buf.append(ch); print(ch,end="",flush=True)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            cursor_hide()
+
+            u = "".join(buf).strip()
+            if not u: continue
+
+            move_to(prompt_r+1, max(1,(w-42)//2))
+            print(f"  {C.DIM}Verifying @{u}…{C.RESET}          ", end="", flush=True)
+            try:
+                self.api.user(u); self.username = u
+                move_to(prompt_r+1, max(1,(w-42)//2))
+                print(f"  {C.BGREEN}✓ Welcome, @{u}!{C.RESET}          ", flush=True)
+                time.sleep(0.7); return
+            except Exception as e:
+                move_to(prompt_r+1, max(1,(w-42)//2))
+                print(f"  {C.BRED}✗ {str(e)[:40]}{C.RESET}          ", flush=True)
+                time.sleep(1.2)
+
+    # ── Main event loop ────────────────────────────────────────────────────────
+    def run(self):
+        alt_screen(); cursor_hide()
+        try:
+            if not self.username:
+                self._login_splash()
+            else:
+                # Quick verify
+                try: self.api.user(self.username)
+                except Exception as e:
+                    main_screen(); cursor_show()
+                    print(f"{C.BRED}✗ {e}{C.RESET}"); sys.exit(1)
+            clear()
+            self.repos = self._run_with_loader(
+                f"Loading repos for @{self.username}",
+                self.api.all_repos, self.username)
+            self._full_redraw()
+            self._set_content(self._c_list())
+
+            while True:
+                key = self._getch()
+                _, _, h, _ = self._content_rect()
+
+                if key in ("q","Q","\x03"):
+                    self._quit()
+                elif key == "\033[A":   # Up
+                    self.sel = (self.sel-1) % len(self.MENU_ITEMS)
+                    self._draw_sidebar()
+                elif key == "\033[B":   # Down
+                    self.sel = (self.sel+1) % len(self.MENU_ITEMS)
+                    self._draw_sidebar()
+                elif key in ("\r","\n"," "):
+                    try:    self._dispatch()
+                    except RuntimeError as e:
+                        self._set_content([f"{C.BRED}⚠  {e}{C.RESET}"])
+                    except Exception as e:
+                        self._set_content([f"{C.BRED}Error: {e}{C.RESET}"])
+                    self._draw_sidebar()
+                elif key == "\033[5":   # PgUp
+                    self.scroll = max(0, self.scroll-20)
+                    self._draw_content()
+                elif key == "\033[6":   # PgDn
+                    self.scroll = min(max(0,len(self.content)-h), self.scroll+20)
+                    self._draw_content()
+                elif key == "r":
+                    self.api.clear_cache(); self.repos=[]
+                    try:
+                        self._ensure_repos()
+                        self.status=f"Refreshed · {len(self.repos)} repos"
+                        self._draw_frame()
+                    except Exception as e:
+                        self.status=f"Refresh failed: {e}"
+                        self._draw_frame()
+        finally:
+            cursor_show(); main_screen()
+
+    def _quit(self):
+        cursor_show(); main_screen()
+        print(f"\n  {C.BCYAN}Thanks for using GitNav. Goodbye!{C.RESET}\n")
+        sys.exit(0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  INSTALL HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+def offer_install():
+    print(f"\n{C.BCYAN}╔{'═'*58}╗{C.RESET}")
+    print(f"{C.BCYAN}║{C.RESET}  {C.BOLD}GitNav — First Run · System-Wide Install?{C.RESET}           {C.BCYAN}║{C.RESET}")
+    print(f"{C.BCYAN}╠{'═'*58}╣{C.RESET}")
+    print(f"{C.BCYAN}║{C.RESET}  Install to {C.BWHITE}{INSTALL_TO}{C.RESET}              {C.BCYAN}║{C.RESET}")
+    print(f"{C.BCYAN}║{C.RESET}  Enables: {C.BYELLOW}gitnav{C.RESET} / {C.BYELLOW}gitnav -cli{C.RESET} / {C.BYELLOW}gitnav -ui{C.RESET}              {C.BCYAN}║{C.RESET}")
+    print(f"{C.BCYAN}╚{'═'*58}╝{C.RESET}")
+    ans = input(f"\n  {C.BYELLOW}▸{C.RESET} Install system-wide? [y/N]: ").strip().lower()
+    if ans == "y": _do_install()
+    FIRST_RUN.touch()
+
+def _do_install():
+    src = os.path.realpath(__file__)
+    try:
+        shutil.copy2(src, INSTALL_TO)
+        os.chmod(INSTALL_TO, 0o755)
+        print(f"  {C.BGREEN}✓ Installed to {INSTALL_TO}{C.RESET}")
+        print(f"  {C.DIM}Run: gitnav | gitnav -cli | gitnav -ui{C.RESET}")
+    except PermissionError:
+        try:
+            subprocess.run(["sudo","cp",src,INSTALL_TO],check=True)
+            subprocess.run(["sudo","chmod","755",INSTALL_TO],check=True)
+            print(f"  {C.BGREEN}✓ Installed (sudo) to {INSTALL_TO}{C.RESET}")
+        except Exception as e:
+            print(f"  {C.BRED}✗ Install failed: {e}{C.RESET}")
+            print(f"  {C.DIM}Manual: sudo cp {src} {INSTALL_TO} && sudo chmod 755 {INSTALL_TO}{C.RESET}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+def main():
+    parser = argparse.ArgumentParser(
+        prog="gitnav",
+        description="Enhanced GitHub Repository Navigator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(f"""\
+            Modes:
+              gitnav            prompt for CLI or UI
+              gitnav -cli       classic text-menu mode
+              gitnav -ui        full-screen interactive TUI
+
+            Options:
+              -u USERNAME       pre-load a GitHub username
+              -t TOKEN          GitHub personal access token (higher rate limits)
+              --install         install system-wide to {INSTALL_TO}
+
+            Dev: oxbv1 | oxborn3  ·  oxborn3.com  ·  contact@oxborn3.com
+            Repo: github.com/0xb0rn3/gitnav   v{VERSION}
+        """)
+    )
+    parser.add_argument("-cli","--cli",   action="store_true", help="CLI menu mode")
+    parser.add_argument("-ui", "--ui",    action="store_true", help="Interactive TUI mode")
+    parser.add_argument("-u",  "--user",  metavar="USERNAME",  help="GitHub username")
+    parser.add_argument("-t",  "--token", metavar="TOKEN",     help="GitHub personal access token")
+    parser.add_argument("--install",      action="store_true", help="Install to system PATH")
+    parser.add_argument("--version",      action="version",    version=f"GitNav v{VERSION}")
+    args = parser.parse_args()
+
+    if args.install:
+        _do_install(); return
+
+    if not FIRST_RUN.exists():
+        offer_install()
+
+    if args.cli and args.ui:
+        print(f"{C.BRED}✗  --cli and --ui are mutually exclusive.{C.RESET}"); sys.exit(1)
+
+    api = GitHubAPI(token=args.token)
+
+    if args.cli:
+        mode = "cli"
+    elif args.ui:
+        mode = "ui"
+    else:
+        clear(); print(BANNER)
+        print(f"  {C.BCYAN}Select interface mode:{C.RESET}\n")
+        print(f"  {C.BWHITE}1){C.RESET}  {C.BYELLOW}CLI{C.RESET}  — Classic text menu  (any terminal)")
+        print(f"  {C.BWHITE}2){C.RESET}  {C.BYELLOW}UI{C.RESET}   — Full-screen TUI    (recommended)\n")
+        while True:
+            choice = input(f"  {C.BYELLOW}▸{C.RESET} Mode [1/cli  or  2/ui]: ").strip().lower()
+            if choice in ("1","cli"): mode="cli"; break
+            if choice in ("2","ui"):  mode="ui";  break
+
+    if mode == "cli":
+        CLI(api, args.user or "").run()
+    else:
+        TUI(api, args.user or "").run()
+
+if __name__ == "__main__":
+    main()
