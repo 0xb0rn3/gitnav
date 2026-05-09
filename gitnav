@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 # ═══════════════════════════════════════════════════════════════════════════════
-#  GitNav v2.0.0  —  Enhanced GitHub Repository Navigator
+#  GitNav v2.1.0  —  Enhanced GitHub Repository Navigator
 #  Dev    : oxbv1 | oxborn3
 #  Contact: contact@oxborn3.com
 #  Site   : oxborn3.com
 #  Repo   : github.com/0xb0rn3/gitnav
+#
+#  New in v2.1.0:
+#    • Fixed arrow-key / escape sequence leak into content pane during
+#      backup and clone operations (raw echo suppression + stdin drain)
+#    • Default clone destination is now ~/.gitnav_backups/<user>/ instead of cwd
+#    • Drain buffered keypresses after every long-running operation
 #
 #  New in v2.0.0:
 #    • Improved TUI — live rate-limit bar, scrollbar, wider sidebar
@@ -16,7 +22,7 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import sys, os, time, shutil, subprocess, threading, webbrowser, json, glob
-import argparse, textwrap, re, struct, fcntl, termios, signal
+import argparse, textwrap, re, struct, fcntl, termios, signal, select, contextlib
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
@@ -77,20 +83,20 @@ def _bootstrap_requests():
 
     print(f"""
   {_C}All automatic install attempts failed.{_R}
-  Arch Linux :  sudo pacman -S python-requests
-  Debian/Ubuntu: sudo apt install python3-requests
-  Fedora/RHEL:  sudo dnf install python3-requests
-  Generic pip:  pip install requests --break-system-packages
+  Arch Linux   :  sudo pacman -S python-requests
+  Debian/Ubuntu:  sudo apt install python3-requests
+  Fedora/RHEL  :  sudo dnf install python3-requests
+  Generic pip  :  pip install requests --break-system-packages
 """)
     sys.exit(1)
 
 requests = _bootstrap_requests()
 
-VERSION    = "2.0.0"
-FIRST_RUN  = Path.home() / ".gitnav_installed"
-INSTALL_TO = "/usr/local/bin/gitnav"
-API_BASE   = "https://api.github.com"
-TIMEOUT    = 20
+VERSION     = "2.1.0"
+FIRST_RUN   = Path.home() / ".gitnav_installed"
+INSTALL_TO  = "/usr/local/bin/gitnav"
+API_BASE    = "https://api.github.com"
+TIMEOUT     = 20
 BACKUP_ROOT = Path.home() / ".gitnav_backups"
 STATE_FILE  = Path.home() / ".gitnav_backup_state.json"
 
@@ -215,10 +221,10 @@ _backup_state = BackupState()
 class TokenPool:
     """Round-robin token rotation with per-token rate-limit tracking."""
     def __init__(self, tokens=None):
-        self._tokens  = tokens or []       # list of token strings
-        self._idx     = 0
-        self._lock    = threading.Lock()
-        self._exhausted = set()            # indices of exhausted tokens
+        self._tokens    = tokens or []
+        self._idx       = 0
+        self._lock      = threading.Lock()
+        self._exhausted = set()
 
     def add(self, token_str):
         """Accept comma or colon separated tokens."""
@@ -236,9 +242,8 @@ class TokenPool:
             if mark_exhausted:
                 self._exhausted.add(self._idx % len(self._tokens))
             if len(self._exhausted) >= len(self._tokens):
-                return False              # all tokens exhausted
+                return False
             self._idx = (self._idx + 1) % len(self._tokens)
-            # skip exhausted tokens
             for _ in range(len(self._tokens)):
                 if (self._idx % len(self._tokens)) not in self._exhausted:
                     break
@@ -293,16 +298,13 @@ class GitHubAPI:
                 r = self.session.get(url, params=params, timeout=TIMEOUT)
                 self._handle_rate(r.headers)
 
-                # Rate limited — try to rotate token or wait
                 if r.status_code in (403, 429):
                     wait = max(0, self.rate_reset_ts - int(time.time())) if self.rate_reset_ts else 60
-                    # Try token rotation first
                     if _token_pool.count() > 1 and _token_pool.fresh_count() > 1:
                         _token_pool.rotate(mark_exhausted=True)
                         self._set_auth()
                         time.sleep(0.3)
                         continue
-                    # No rotation possible — wait
                     raise RuntimeError(f"Rate limited (403/429). Reset in {wait}s. "
                                        f"Add more tokens with -t tok1,tok2 to rotate.")
 
@@ -365,7 +367,7 @@ class CloneEngine:
       full       — standard full clone (default)
       blobless   — --filter=blob:none  (tree+commits local, blobs on demand)
       treeless   — --filter=tree:0     (commits local only, trees+blobs on demand)
-      shallow    -- --depth N          (last N commits only)
+      shallow    — --depth N           (last N commits only)
 
     Also supports:
       --jobs N   — parallel pack-object threads
@@ -377,30 +379,23 @@ class CloneEngine:
         "full":     [],
         "blobless": ["--filter=blob:none"],
         "treeless": ["--filter=tree:0"],
-        "shallow":  ["--depth", "1"],         # depth filled in at call time
+        "shallow":  ["--depth", "1"],
     }
 
     @staticmethod
     def _git_env():
-        """Env overrides to maximise clone throughput."""
         env = os.environ.copy()
-        env["GIT_HTTP_LOW_SPEED_LIMIT"]  = "1024"   # abort if <1KB/s
-        env["GIT_HTTP_LOW_SPEED_TIME"]   = "30"      # … for 30 seconds
+        env["GIT_HTTP_LOW_SPEED_LIMIT"]  = "1024"
+        env["GIT_HTTP_LOW_SPEED_TIME"]   = "30"
         env["GIT_HTTP_CONNECT_TIMEOUT"]  = "30"
-        env["GCM_INTERACTIVE"]           = "never"   # suppress credential UI
+        env["GCM_INTERACTIVE"]           = "never"
         return env
 
     @staticmethod
     def clone(url, dest, strategy="blobless", depth=1, jobs=4,
               on_line=None, retry=3):
-        """
-        Clone `url` into `dest`.
-        on_line(str) callback receives each stderr line as it arrives.
-        Returns (returncode, last_error_line).
-        """
         flags = CloneEngine.STRATEGIES.get(strategy, []).copy()
         if strategy == "shallow":
-            # Replace placeholder with actual depth
             idx = flags.index("--depth") + 1 if "--depth" in flags else -1
             if idx >= 0: flags[idx] = str(depth)
             else: flags = ["--depth", str(depth)]
@@ -412,7 +407,6 @@ class CloneEngine:
         last_err = ""
         for attempt in range(retry):
             if os.path.exists(dest) and attempt > 0:
-                # Partial clone dir — remove before retry
                 shutil.rmtree(dest, ignore_errors=True)
 
             try:
@@ -430,7 +424,6 @@ class CloneEngine:
                 if proc.returncode == 0:
                     return 0, ""
 
-                # Transient network errors → retry
                 transient = any(k in last_err.lower() for k in
                                 ("connection reset","timed out","unable to connect",
                                  "ssl","eof","broken pipe","network"))
@@ -449,10 +442,6 @@ class CloneEngine:
 
     @staticmethod
     def update(repo_path, on_line=None):
-        """
-        For an already-cloned repo: fetch all remotes + pull current branch.
-        Returns (returncode, message).
-        """
         env = CloneEngine._git_env()
         steps = [
             (["git", "-C", repo_path, "remote", "update", "--prune"], "Fetching remote updates"),
@@ -600,7 +589,6 @@ class CLI:
             print(f"  {C.BRED}Invalid choice.{C.RESET}")
 
     def _show_menu(self):
-        # Rate limit indicator
         rem  = self.api.rate_remaining
         lim  = self.api.rate_limit_val
         toks = _token_pool.count()
@@ -635,18 +623,13 @@ class CLI:
     def _do_list(self):
         repos = self._load_repos()
         self._header("Repositories", "📋"); self._sep()
-        state = _backup_state.get_user(self.username)
         bdir  = BACKUP_ROOT / self.username
         for i, r in enumerate(repos, 1):
             lang  = f"{C.BBLUE}[{(r.get('language') or '—'):>10}]{C.RESET}"
             stars = f"{C.BYELLOW}★{fmt_num(r.get('stargazers_count',0)):<5}{C.RESET}"
             name  = f"{C.BWHITE}{r['name']}{C.RESET}"
             priv  = f" {C.BRED}[private]{C.RESET}" if r.get("private") else ""
-            # Backup badge
-            if (bdir / r["name"] / ".git").exists():
-                bk = f" {C.BGREEN}[bk]{C.RESET}"
-            else:
-                bk = ""
+            bk = f" {C.BGREEN}[bk]{C.RESET}" if (bdir / r["name"] / ".git").exists() else ""
             print(f"  {C.DIM}{i:>3}.{C.RESET}  {lang}  {stars}  {name}{priv}{bk}")
         self._sep()
         print(f"  {C.DIM}{len(repos)} repositories{C.RESET}")
@@ -715,9 +698,11 @@ class CLI:
         self._header("Clone Repository", "📥")
         repo = self._pick_repo("Repository to clone")
         if not repo: return
-        dest = self._prompt("Destination directory", ".")
 
-        # Strategy selection
+        # Default destination: user's backup directory
+        default_dest = str(BACKUP_ROOT / self.username)
+        dest = self._prompt(f"Destination directory [{default_dest}]", default_dest)
+
         print(f"\n  {C.BBLUE}Clone strategy:{C.RESET}")
         print(f"  {C.DIM}1){C.RESET} full      — complete clone (slow on large repos)")
         print(f"  {C.DIM}2){C.RESET} blobless  — {C.BGREEN}recommended{C.RESET} — no blobs until needed")
@@ -732,30 +717,34 @@ class CLI:
         try: jobs = int(jobs)
         except: jobs = 4
 
+        # Ensure destination exists
+        Path(dest).mkdir(parents=True, exist_ok=True)
+
         url  = f"https://github.com/{self.username}/{repo}.git"
         path = os.path.join(dest, repo)
         print(f"\n  {C.DIM}Cloning {url}{C.RESET}")
+        print(f"  {C.DIM}Into    {path}{C.RESET}")
         print(f"  {C.DIM}Strategy: {strategy}  jobs: {jobs}{C.RESET}\n")
 
         def on_line(l): print(f"  {C.DIM}{l}{C.RESET}")
         rc, err = CloneEngine.clone(url, path, strategy=strategy, jobs=jobs, on_line=on_line)
-        if rc == 0: print(f"\n  {C.BGREEN}✓ Cloned to {path}{C.RESET}")
-        else:       print(f"\n  {C.BRED}✗ Clone failed: {err}{C.RESET}")
+        if rc == 0:
+            _backup_state.mark(self.username, repo, "ok")
+            print(f"\n  {C.BGREEN}✓ Cloned to {path}{C.RESET}")
+        else:
+            print(f"\n  {C.BRED}✗ Clone failed: {err}{C.RESET}")
 
     def _do_backup(self):
-        """Backup all repos for current user with smart resume."""
         self._header("Backup All Repos", "💾")
         repos = self._load_repos()
         if not repos:
             print(f"  {C.BRED}No repositories found.{C.RESET}"); return
 
-        # Backup dir
         default_dir = str(BACKUP_ROOT / self.username)
         bdir = self._prompt(f"Backup directory [{default_dir}]", default_dir)
         bdir = Path(bdir).expanduser().resolve()
         bdir.mkdir(parents=True, exist_ok=True)
 
-        # Strategy
         print(f"\n  {C.BBLUE}Clone strategy for new repos:{C.RESET}")
         print(f"  {C.DIM}1){C.RESET} blobless {C.BGREEN}(recommended){C.RESET}  2) full  3) shallow  4) treeless")
         strat_map = {"1":"blobless","2":"full","3":"shallow","4":"treeless",
@@ -767,8 +756,6 @@ class CLI:
         try: jobs = int(jobs)
         except: jobs = 4
 
-        # Audit: what exists already
-        state  = _backup_state.get_user(self.username)
         to_clone  = []
         to_update = []
         for r in repos:
@@ -788,7 +775,6 @@ class CLI:
 
         ok_clone = ok_update = failed = 0
 
-        # ── Clone missing repos ────────────────────────────────────────────────
         if to_clone:
             print(f"\n  {C.BCYAN}━━ Cloning {len(to_clone)} new repos ━━{C.RESET}")
         for r in to_clone:
@@ -808,7 +794,6 @@ class CLI:
                 _backup_state.mark(self.username, r["name"], "failed", err)
                 failed += 1
 
-        # ── Update existing repos ──────────────────────────────────────────────
         if to_update:
             print(f"\n  {C.BCYAN}━━ Updating {len(to_update)} existing repos ━━{C.RESET}")
         for r in to_update:
@@ -826,7 +811,6 @@ class CLI:
                 _backup_state.mark(self.username, r["name"], "failed", msg)
                 failed += 1
 
-        # ── Summary ────────────────────────────────────────────────────────────
         self._sep()
         print(f"\n  {C.BBLUE}Backup complete{C.RESET}")
         print(f"  {C.BGREEN}✓ Cloned  : {ok_clone}{C.RESET}")
@@ -835,10 +819,8 @@ class CLI:
         print(f"  {C.DIM}Location  : {bdir}{C.RESET}")
 
     def _do_browse_backup(self):
-        """Interactive local backup directory browser."""
         self._header("Browse Backup Directory", "📁")
 
-        # Choose root
         default_dir = str(BACKUP_ROOT / self.username) if self.username else str(BACKUP_ROOT)
         start = self._prompt(f"Directory to browse [{default_dir}]", default_dir)
         cwd   = Path(start).expanduser().resolve()
@@ -959,7 +941,7 @@ class CLI:
                 print(f"    {C.BCYAN}↓{C.RESET}  {a['name']:<40}  {C.DIM}{sz} · {dl} downloads{C.RESET}")
                 want = self._prompt(f"Download {a['name']}? [y/N]","n")
                 if want.lower()=="y":
-                    dest  = self._prompt("Save to",".")
+                    dest  = self._prompt("Save to", str(BACKUP_ROOT / self.username))
                     fpath = os.path.join(dest, a["name"])
                     self._download(a["browser_download_url"], fpath)
 
@@ -993,18 +975,18 @@ class CLI:
         with Loader(f"Fetching @{u}"):
             p = self.api.user(u)
         self._sep()
-        self._info("Login",         f"{C.BWHITE}{p.get('login')}{C.RESET}")
-        self._info("Name",          p.get("name") or "—")
-        self._info("Bio",           p.get("bio") or "—")
-        self._info("Location",      p.get("location") or "—")
-        self._info("Company",       p.get("company") or "—")
-        self._info("Blog",          p.get("blog") or "—")
-        self._info("Twitter",       f"@{p['twitter_username']}" if p.get("twitter_username") else "—")
-        self._info("Repos (public)",fmt_num(p.get("public_repos")))
-        self._info("Gists",         fmt_num(p.get("public_gists")))
-        self._info("Followers",     fmt_num(p.get("followers")))
-        self._info("Following",     fmt_num(p.get("following")))
-        self._info("Member since",  fmt_date(p.get("created_at")))
+        self._info("Login",          f"{C.BWHITE}{p.get('login')}{C.RESET}")
+        self._info("Name",           p.get("name") or "—")
+        self._info("Bio",            p.get("bio") or "—")
+        self._info("Location",       p.get("location") or "—")
+        self._info("Company",        p.get("company") or "—")
+        self._info("Blog",           p.get("blog") or "—")
+        self._info("Twitter",        f"@{p['twitter_username']}" if p.get("twitter_username") else "—")
+        self._info("Repos (public)", fmt_num(p.get("public_repos")))
+        self._info("Gists",          fmt_num(p.get("public_gists")))
+        self._info("Followers",      fmt_num(p.get("followers")))
+        self._info("Following",      fmt_num(p.get("following")))
+        self._info("Member since",   fmt_date(p.get("created_at")))
         self._sep()
 
     def _do_refresh(self):
@@ -1038,22 +1020,21 @@ class TUI:
         ("🔄","Refresh"),
         ("❌","Exit"),
     ]
-    # Section colours for sidebar items
     _ITEM_COLORS = {
-        "List Repos":      C.BCYAN,
-        "Detailed List":   C.BCYAN,
-        "Search":          C.BYELLOW,
-        "Statistics":      C.BBLUE,
-        "Clone":           C.BGREEN,
-        "Backup All Repos":C.BMAGENTA,
+        "List Repos":       C.BCYAN,
+        "Detailed List":    C.BCYAN,
+        "Search":           C.BYELLOW,
+        "Statistics":       C.BBLUE,
+        "Clone":            C.BGREEN,
+        "Backup All Repos": C.BMAGENTA,
         "Browse Backup Dir":C.BMAGENTA,
-        "View README":     C.BWHITE,
-        "Issues":          C.BYELLOW,
-        "Releases":        C.BCYAN,
-        "Open Browser":    C.BBLUE,
-        "User Profile":    C.BWHITE,
-        "Refresh":         C.DIM,
-        "Exit":            C.BRED,
+        "View README":      C.BWHITE,
+        "Issues":           C.BYELLOW,
+        "Releases":         C.BCYAN,
+        "Open Browser":     C.BBLUE,
+        "User Profile":     C.BWHITE,
+        "Refresh":          C.DIM,
+        "Exit":             C.BRED,
     }
 
     def __init__(self, api, username=""):
@@ -1070,6 +1051,46 @@ class TUI:
     def _on_resize(self, *_):
         self.cols, self.rows = term_size()
         self._full_redraw()
+
+    # ── stdin echo suppression ──────────────────────────────────────────────────
+    @contextlib.contextmanager
+    def _no_echo(self):
+        """
+        Suppress terminal echo + canonicalization during long-running ops
+        (backup, clone). Prevents arrow-key escape sequences from leaking
+        into stdout and corrupting the TUI content pane.
+        After the op, drain any buffered keystrokes so they don't trigger
+        spurious menu actions.
+        """
+        fd = sys.stdin.fileno()
+        try:
+            old = termios.tcgetattr(fd)
+            new = list(old)
+            # lflags: clear ECHO, ECHOE, ECHOK, ECHONL, ICANON
+            new[3] = new[3] & ~(termios.ECHO | termios.ECHOE |
+                                termios.ECHOK | termios.ECHONL |
+                                termios.ICANON)
+            termios.tcsetattr(fd, termios.TCSADRAIN, new)
+        except Exception:
+            old = None
+        try:
+            yield
+        finally:
+            if old is not None:
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                except Exception:
+                    pass
+            self._drain_input()
+
+    def _drain_input(self):
+        """Discard any keypresses buffered while a long op was running."""
+        try:
+            fd = sys.stdin.fileno()
+            while select.select([fd], [], [], 0)[0]:
+                os.read(fd, 256)
+        except Exception:
+            pass
 
     # ── Raw keyboard input ──────────────────────────────────────────────────────
     def _getch(self):
@@ -1125,7 +1146,6 @@ class TUI:
         return ans or default
 
     def _ask_choice(self, question, choices, default=""):
-        """Display numbered list of choices and read selection."""
         tr, lc, h, w = self._content_rect()
         start_row = tr + h - len(choices) - 2
         for i, c in enumerate(choices):
@@ -1186,14 +1206,12 @@ class TUI:
         sw   = self.SIDEBAR_W
         A    = C.BCYAN; R = C.RESET
 
-        # Outer border
         move_to(1,1); print(f"{A}╔{'═'*(w-2)}╗{R}",end="",flush=True)
         for r in range(2,h+1):
             move_to(r,1);  print(f"{A}║{R}",end="",flush=True)
             move_to(r,w);  print(f"{A}║{R}",end="",flush=True)
         move_to(h,1); print(f"{A}╚{'═'*(w-2)}╝{R}",end="",flush=True)
 
-        # Title bar row 2 — with rate limit
         rem  = self.api.rate_remaining
         lim  = self.api.rate_limit_val
         toks = _token_pool.count()
@@ -1207,22 +1225,19 @@ class TUI:
             if toks > 0:
                 rl_part += f" {C.DIM}│{R} {C.BCYAN}tokens:{_token_pool.fresh_count()}/{toks}{R}"
 
-        rl_plain = strip_ansi(rl_part)
+        rl_plain   = strip_ansi(rl_part)
         user_plain = strip_ansi(user)
-        title_plain = strip_ansi(title)
+        title_plain= strip_ansi(title)
         gap = " " * max(0, w - 4 - len(title_plain) - len(user_plain) - len(rl_plain))
         move_to(2,2)
         print(f"{C.BG_BBLUE}{C.BWHITE}{C.BOLD}{title}{R}{C.DIM}{rl_part}{gap}{A}{user}{R}",
               end="", flush=True)
 
-        # Divider row 3
         move_to(3,1); print(f"{A}╠{'═'*sw}╦{'═'*(w-sw-3)}╣{R}",end="",flush=True)
 
-        # Sidebar divider
         for r in range(4, h):
             move_to(r, sw+1); print(f"{A}║{R}",end="",flush=True)
 
-        # Status bar row h-1 and h
         move_to(h-1,1); print(f"{A}╠{'═'*(w-2)}╣{R}",end="",flush=True)
         move_to(h,2)
         keys = (f" {C.DIM}↑↓{R} nav  {C.DIM}Enter/Space{R} select  "
@@ -1234,7 +1249,6 @@ class TUI:
         sw = self.SIDEBAR_W
         move_to(4,2); print(f"{C.GRAY} ▸ MENU{C.RESET}",end="",flush=True)
 
-        # Backup dir indicator
         bdir = BACKUP_ROOT / self.username if self.username else None
         bk_badge = ""
         if bdir and bdir.exists():
@@ -1267,7 +1281,6 @@ class TUI:
         tr, lc, h, w = self._content_rect()
         visible = self.content[self.scroll : self.scroll+h]
 
-        # Scrollbar
         total = len(self.content)
         if total > h:
             sb_col = max(1, round(h * h / total))
@@ -1279,7 +1292,6 @@ class TUI:
             move_to(tr+i, lc); erase_to_eol()
             if i < len(visible):
                 print(truncate(visible[i], w-1), end="", flush=True)
-            # Scrollbar in the rightmost column of content area
             sc = lc + w - 1
             move_to(tr+i, sc)
             if total > h:
@@ -1333,9 +1345,8 @@ class TUI:
         for r in self.repos:
             l=r.get("language")
             if l: langs[l]+=1
-        public = sum(1 for r in self.repos if not r.get("private"))
+        public = sum(1 for r in repos if not r.get("private")) if (repos := self.repos) else 0
 
-        # Local backup stats
         bdir  = BACKUP_ROOT / self.username
         bk_count = 0; bk_size = 0
         if bdir.exists():
@@ -1431,8 +1442,10 @@ class TUI:
         return lines
 
     def _c_clone_output(self, repo, url, strategy, rc, lines_out):
-        col = C.BGREEN if rc == 0 else C.BRED
-        status = "✓ Clone complete!" if rc == 0 else f"✗ Clone failed (exit {rc})"
+        col    = C.BGREEN if rc == 0 else (C.BRED if rc is not None else C.DIM)
+        status = ("✓ Clone complete!" if rc == 0
+                  else f"✗ Clone failed (exit {rc})" if rc is not None
+                  else "⠸ Cloning…")
         header = [
             f"{C.BBLUE}{C.BOLD}  📥 Clone: {repo}{C.RESET}", "",
             f"  {C.DIM}URL      : {url}{C.RESET}",
@@ -1445,7 +1458,8 @@ class TUI:
     def _c_backup(self, repos, bdir, strategy, jobs):
         """
         Run a full backup with live content-pane updates.
-        Yields content lines as backup progresses.
+        Wraps all subprocess calls in _no_echo() to prevent arrow-key
+        escape sequences from leaking into the TUI during long git ops.
         """
         bdir = Path(bdir)
         bdir.mkdir(parents=True, exist_ok=True)
@@ -1473,8 +1487,8 @@ class TUI:
         for r in to_clone:
             url  = f"https://github.com/{self.username}/{r['name']}.git"
             dest = str(bdir / r["name"])
-            repo_lines = [f"  {C.BWHITE}→ {r['name']}{C.RESET}  {C.DIM}(cloning){C.RESET}"]
-            self.content.extend(repo_lines)
+            self.content.append(
+                f"  {C.BWHITE}→ {r['name']}{C.RESET}  {C.DIM}(cloning){C.RESET}")
             self._draw_content()
 
             clone_lines = []
@@ -1483,8 +1497,9 @@ class TUI:
                 self.content[-1] = f"  {C.DIM}{l}{C.RESET}"
                 self._draw_content()
 
-            rc, err = CloneEngine.clone(url, dest, strategy=strategy,
-                                        jobs=jobs, on_line=on_line)
+            with self._no_echo():
+                rc, err = CloneEngine.clone(url, dest, strategy=strategy,
+                                            jobs=jobs, on_line=on_line)
             if rc == 0:
                 self.content.append(f"  {C.BGREEN}✓ {r['name']} cloned{C.RESET}")
                 _backup_state.mark(self.username, r["name"], "ok")
@@ -1499,14 +1514,17 @@ class TUI:
         # ── Update existing repos ────────────────────────────────────────────
         for r in to_update:
             rp = str(bdir / r["name"])
-            self.content.append(f"  {C.BYELLOW}↻ {r['name']}{C.RESET}  {C.DIM}(updating){C.RESET}")
+            self.content.append(
+                f"  {C.BYELLOW}↻ {r['name']}{C.RESET}  {C.DIM}(updating){C.RESET}")
             self._draw_content()
 
             def on_ln(l):
                 self.content.append(f"    {C.DIM}{l}{C.RESET}")
                 self._draw_content()
 
-            rc, msg = CloneEngine.update(rp, on_line=on_ln)
+            with self._no_echo():
+                rc, msg = CloneEngine.update(rp, on_line=on_ln)
+
             if rc == 0:
                 self.content.append(f"  {C.BGREEN}✓ {r['name']} updated{C.RESET}")
                 _backup_state.mark(self.username, r["name"], "updated")
@@ -1530,12 +1548,10 @@ class TUI:
         self.content.append(f"  {C.DIM}Timestamp : {fmt_ts()}{C.RESET}")
         self.scroll = max(0, len(self.content) - (self._content_rect()[2]))
         self._draw_content()
+        # Drain any keys pressed during the entire backup
+        self._drain_input()
 
     def _c_browse_dir(self, start_path):
-        """
-        Interactive local directory browser inside the TUI content pane.
-        Returns when user presses 'q' or navigates all the way out.
-        """
         cwd = Path(start_path).expanduser().resolve()
 
         while True:
@@ -1566,7 +1582,7 @@ class TUI:
                 if is_git:
                     info = ustate.get(d.name, {})
                     s = info.get("status","")
-                    if s == "ok":      st_badge = f" {C.BGREEN}[ok]{C.RESET}"
+                    if s == "ok":        st_badge = f" {C.BGREEN}[ok]{C.RESET}"
                     elif s == "updated": st_badge = f" {C.BYELLOW}[upd]{C.RESET}"
                     elif s == "failed":  st_badge = f" {C.BRED}[fail]{C.RESET}"
                 try:
@@ -1642,9 +1658,11 @@ class TUI:
             self._ensure_repos()
             repo = self._repo_picker("Repo to clone (name or #)")
             if not repo: return
-            dest = self._ask("Destination directory", ".")
 
-            # Show strategy picker in content pane
+            # Default destination: user's backup directory
+            default_dest = str(BACKUP_ROOT / self.username)
+            dest = self._ask(f"Dest dir [{default_dest}]", default_dest)
+
             strat_lines = [
                 f"{C.BBLUE}{C.BOLD}  📥 Clone: {repo}{C.RESET}", "",
                 f"  {C.BWHITE}Select clone strategy:{C.RESET}", "",
@@ -1663,6 +1681,9 @@ class TUI:
             try: jobs = int(jobs_s)
             except: jobs = 4
 
+            # Ensure destination exists
+            Path(dest).mkdir(parents=True, exist_ok=True)
+
             url  = f"https://github.com/{self.username}/{repo}.git"
             path = os.path.join(dest, repo)
             out_lines = []
@@ -1672,9 +1693,12 @@ class TUI:
                 self._set_content(self._c_clone_output(repo, url, strategy, None, ol))
 
             self._set_content(self._c_clone_output(repo, url, strategy, None, []))
-            rc, err = CloneEngine.clone(url, path, strategy=strategy,
-                                        jobs=jobs, on_line=on_line)
+            with self._no_echo():
+                rc, err = CloneEngine.clone(url, path, strategy=strategy,
+                                            jobs=jobs, on_line=on_line)
             self._set_content(self._c_clone_output(repo, url, strategy, rc, out_lines))
+            if rc == 0:
+                _backup_state.mark(self.username, repo, "ok")
 
         elif action == "Backup All Repos":
             self._ensure_repos()
@@ -1703,7 +1727,7 @@ class TUI:
             try: jobs = int(jobs_s)
             except: jobs = 4
 
-            confirm = self._ask(f"Back up {len(repos)} repos? [y/N]", "n")
+            confirm = self._ask(f"Back up {len(repos)} repos to {bdir}? [y/N]", "n")
             if confirm.lower() != "y":
                 self._set_content([f"  {C.DIM}Cancelled.{C.RESET}"]); return
 
@@ -1890,7 +1914,6 @@ class TUI:
                         self.status=f"Refresh failed: {e}"
                         self._draw_frame()
                 elif key == "b":
-                    # Quick-jump to Backup All Repos
                     for i,(e,l) in enumerate(self.MENU_ITEMS):
                         if l == "Backup All Repos": self.sel = i
                     self._draw_sidebar()
@@ -1944,7 +1967,7 @@ def _do_install():
 def main():
     parser = argparse.ArgumentParser(
         prog="gitnav",
-        description="Enhanced GitHub Repository Navigator v2.0.0",
+        description=f"Enhanced GitHub Repository Navigator v{VERSION}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(f"""\
             Modes:
@@ -1983,12 +2006,10 @@ def main():
     if args.install:
         _do_install(); return
 
-    # Override backup root if provided
     if args.backup_dir:
         global BACKUP_ROOT
         BACKUP_ROOT = Path(args.backup_dir).expanduser().resolve()
 
-    # Load tokens into pool
     if args.token:
         _token_pool.add(args.token)
 
@@ -1998,7 +2019,7 @@ def main():
     if args.cli and args.ui:
         print(f"{C.BRED}✗  --cli and --ui are mutually exclusive.{C.RESET}"); sys.exit(1)
 
-    api = GitHubAPI()   # token handled via pool
+    api = GitHubAPI()
 
     if args.cli:
         mode = "cli"
